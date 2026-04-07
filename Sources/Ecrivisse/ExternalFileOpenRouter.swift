@@ -10,9 +10,18 @@ final class ExternalFileOpenRouter: ObservableObject {
     private init() {}
 
     func enqueue(urls: [URL]) {
-        let fileURLs = urls.filter { $0.isFileURL }
-        guard !fileURLs.isEmpty else { return }
-        pendingFileURLs.append(contentsOf: fileURLs)
+        let validFileURLs = urls.compactMap { url -> URL? in
+            guard url.isFileURL else { return nil }
+
+            if let isDirectory = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory,
+               isDirectory == true {
+                return nil
+            }
+
+            return url
+        }
+        guard !validFileURLs.isEmpty else { return }
+        pendingFileURLs.append(contentsOf: validFileURLs)
         eventID &+= 1
     }
 

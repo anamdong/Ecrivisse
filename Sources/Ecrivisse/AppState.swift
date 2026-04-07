@@ -232,19 +232,22 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         panel.prompt = "Open"
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        do {
-            try openDocument(at: url, shouldConfirmDiscard: false)
-        } catch {
-            present(error: error)
-        }
+        _ = openDocument(at: url, shouldConfirmDiscard: false)
     }
 
-    func openDocument(at url: URL) {
+    @discardableResult
+    func openDocument(at url: URL) -> Bool {
+        openDocument(at: url, shouldConfirmDiscard: shouldPromptToDiscardCurrentDocument())
+    }
+
+    @discardableResult
+    private func openDocument(at url: URL, shouldConfirmDiscard: Bool) -> Bool {
         do {
-            try openDocument(at: url, shouldConfirmDiscard: true)
+            try loadDocument(at: url, shouldConfirmDiscard: shouldConfirmDiscard)
+            return true
         } catch {
             present(error: error)
+            return false
         }
     }
 
@@ -373,7 +376,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
     }
 
     private func confirmDiscardIfNeeded() -> Bool {
-        guard isDirty else { return true }
+        guard shouldPromptToDiscardCurrentDocument() else { return true }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -383,6 +386,16 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         alert.addButton(withTitle: "Cancel")
 
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func shouldPromptToDiscardCurrentDocument() -> Bool {
+        guard isDirty else { return false }
+
+        if documentURL != nil {
+            return true
+        }
+
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private static func readText(from url: URL) throws -> String {
@@ -419,7 +432,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         throw AppStateError.unreadableTextEncoding
     }
 
-    private func openDocument(at url: URL, shouldConfirmDiscard: Bool) throws {
+    private func loadDocument(at url: URL, shouldConfirmDiscard: Bool) throws {
         if shouldConfirmDiscard {
             guard confirmDiscardIfNeeded() else { return }
         }

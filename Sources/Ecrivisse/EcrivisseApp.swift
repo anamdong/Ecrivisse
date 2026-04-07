@@ -21,6 +21,18 @@ struct EcrivisseApp: App {
 }
 
 final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Finder/Open-With can launch the app with file paths in argv before
+        // regular open-file delegate callbacks are observed.
+        let launchArgumentURLs = CommandLine.arguments
+            .dropFirst()
+            .compactMap(Self.fileURLFromLaunchArgument(_:))
+
+        if !launchArgumentURLs.isEmpty {
+            enqueue(urls: launchArgumentURLs)
+        }
+    }
+
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         enqueue(urls: [URL(fileURLWithPath: filename)])
         return true
@@ -37,9 +49,48 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func enqueue(urls: [URL]) {
+        guard !urls.isEmpty else { return }
         Task { @MainActor in
             ExternalFileOpenRouter.shared.enqueue(urls: urls)
+            revealWindowForExternalOpen()
         }
+    }
+
+    @MainActor
+    private func revealWindowForExternalOpen(retryCount: Int = 0) {
+        NSApp.unhide(nil)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+
+        if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isExcludedFromWindowsMenu }) ?? NSApp.windows.first {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            return
+        }
+
+        if retryCount == 8 {
+            _ = NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+        }
+
+        guard retryCount < 30 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.revealWindowForExternalOpen(retryCount: retryCount + 1)
+        }
+    }
+
+    private static func fileURLFromLaunchArgument(_ argument: String) -> URL? {
+        guard !argument.isEmpty else { return nil }
+        guard !argument.hasPrefix("-psn_") else { return nil }
+
+        if argument.hasPrefix("file://"), let url = URL(string: argument) {
+            return url
+        }
+
+        let path = NSString(string: argument).expandingTildeInPath
+        guard path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path)
     }
 }
 

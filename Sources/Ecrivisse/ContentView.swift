@@ -196,7 +196,12 @@ struct ContentView: View {
 
     private func handlePendingExternalFiles() {
         let urls = externalFileOpenRouter.drainPendingFileURLs()
-        guard let firstURL = urls.first else { return }
-        appState.openDocument(at: firstURL)
+        guard !urls.isEmpty else { return }
+
+        for url in urls {
+            if appState.openDocument(at: url) {
+                break
+            }
+        }
     }
 }
