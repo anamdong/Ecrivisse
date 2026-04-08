@@ -9,6 +9,7 @@ struct WriterEditorView: NSViewRepresentable {
     var onHorizontalSwipe: (CGFloat) -> Void
     var onAIError: (String) -> Void
     var onUserEdit: (String) -> Void
+    var onEditingLocationChange: (_ caretLocation: Int, _ textLength: Int) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -89,6 +90,7 @@ struct WriterEditorView: NSViewRepresentable {
             textView.setSelectedRange(NSRange(location: location, length: 0))
             textView.scheduleStyling(reason: .fullRefresh)
             context.coordinator.isApplyingExternalChange = false
+            context.coordinator.emitEditingLocation()
         }
 
         textView.handleSummarizeDocumentRequestIfNeeded(requestID: summarizeDocumentRequestID)
@@ -116,8 +118,12 @@ struct WriterEditorView: NSViewRepresentable {
                 forName: NSView.boundsDidChangeNotification,
                 object: scrollView.contentView,
                 queue: .main
-            ) { [weak textView] _ in
+            ) { [weak self, weak textView] _ in
                 textView?.scheduleStyling(reason: .visibleRangeChanged)
+                self?.emitEditingLocation()
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.emitEditingLocation()
             }
         }
 
@@ -137,6 +143,7 @@ struct WriterEditorView: NSViewRepresentable {
             if textView?.hasMarkedText() == true {
                 return
             }
+            emitEditingLocation()
             textView?.scheduleStyling(reason: .selectionChanged)
         }
 
@@ -155,6 +162,12 @@ struct WriterEditorView: NSViewRepresentable {
             parent.text = value
             parent.onUserEdit(value)
             textView.scheduleStyling(reason: .textChanged)
+        }
+
+        func emitEditingLocation() {
+            guard let textView else { return }
+            let snapshot = textView.editingLocationSnapshot()
+            parent.onEditingLocationChange(snapshot.location, snapshot.textLength)
         }
     }
 }
@@ -197,9 +210,7 @@ final class WriterTextView: NSTextView {
                 return
             }
             guard abs(oldValue - editorFontSize) > 0.001 else { return }
-            font = Self.editorFont(size: editorFontSize)
-            refreshTypingAttributes()
-            scheduleStyling(reason: .fullRefresh)
+            applyFontSizeChangeImmediately()
         }
     }
 
@@ -413,6 +424,27 @@ final class WriterTextView: NSTextView {
         }
     }
 
+    private func applyFontSizeChangeImmediately() {
+        font = Self.editorFont(size: editorFontSize)
+
+        if let textStorage {
+            let fullRange = NSRange(location: 0, length: textStorage.length)
+            if fullRange.length > 0 {
+                textStorage.beginEditing()
+                textStorage.addAttribute(.font, value: Self.editorFont(size: editorFontSize), range: fullRange)
+                textStorage.addAttribute(.paragraphStyle, value: Self.baseParagraphStyle, range: fullRange)
+                textStorage.endEditing()
+            }
+        }
+
+        refreshTypingAttributes()
+        needsDisplay = true
+
+        if focusMode != .off || !aiGeneratedRanges.isEmpty {
+            scheduleStyling(reason: .selectionChanged)
+        }
+    }
+
     private func refreshTypingAttributes() {
         typingAttributes = Self.baseAttributes(foreground: .labelColor, fontSize: editorFontSize)
     }
@@ -540,6 +572,12 @@ final class WriterTextView: NSTextView {
         return NSRange(location: location, length: max(0, upperRangeBound - location))
     }
 
+    func editingLocationSnapshot() -> (location: Int, textLength: Int) {
+        let totalLength = (string as NSString).length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        return (selection.location, totalLength)
+    }
+
     private static func editorFont(size: CGFloat) -> NSFont {
         NSFont.monospacedSystemFont(ofSize: clampedFontSize(size), weight: .regular)
     }
@@ -585,6 +623,347 @@ final class WriterTextView: NSTextView {
                 length: selection.length
             )
         )
+        scheduleStyling(reason: .textChanged)
+    }
+
+    func applyMarkdownAction(_ action: MarkdownEditorAction) {
+        guard isEditable else { return }
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+        if hasMarkedText() {
+            unmarkText()
+        }
+
+        switch action {
+        case let .heading(level):
+            applyHeading(level: level)
+        case .bold:
+            applyMarkdownEmphasis(marker: "**")
+        case .italic:
+            applyMarkdownEmphasis(marker: "*")
+        case .boldItalic:
+            applyMarkdownEmphasis(marker: "***")
+        case .strikethrough:
+            applyMarkdownEmphasis(marker: "~~")
+        case .inlineCode:
+            wrapSelection(prefix: "`", suffix: "`", placeholder: "code")
+        case .escapeCharacters:
+            applyEscapedCharacters()
+        case .unorderedList:
+            applyUnorderedList()
+        case .orderedList:
+            applyOrderedList()
+        case .link:
+            insertMarkdownLink()
+        case .codeBlock:
+            insertCodeBlock()
+        case .blockquote:
+            applyBlockquote()
+        case .footnote:
+            insertFootnote()
+        case let .table(rows, columns):
+            insertTable(rows: rows, columns: columns)
+        }
+    }
+
+    private func wrapSelection(prefix: String, suffix: String, placeholder: String = "") {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let prefixLength = (prefix as NSString).length
+
+        let replacement: String
+        let newSelection: NSRange
+        if selection.length > 0 {
+            let selectedText = nsText.substring(with: selection)
+            replacement = "\(prefix)\(selectedText)\(suffix)"
+            newSelection = NSRange(location: selection.location + prefixLength, length: selection.length)
+        } else {
+            replacement = "\(prefix)\(placeholder)\(suffix)"
+            newSelection = NSRange(location: selection.location + prefixLength, length: (placeholder as NSString).length)
+        }
+
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+        setSelectedRange(newSelection)
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func applyHeading(level: Int) {
+        let clampedLevel = min(max(level, 1), 6)
+        let prefix = String(repeating: "#", count: clampedLevel) + " "
+        transformSelectedLines { line, _ in
+            let stripped = line.replacingOccurrences(
+                of: #"^\s{0,3}#{1,6}\s*"#,
+                with: "",
+                options: .regularExpression
+            )
+            return prefix + stripped.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private func applyUnorderedList() {
+        transformSelectedLines { line, _ in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return line }
+            let stripped = line.replacingOccurrences(
+                of: #"^\s*(?:[-*+]\s+|\d+\.\s+)"#,
+                with: "",
+                options: .regularExpression
+            )
+            return "- " + stripped.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private func applyOrderedList() {
+        var itemIndex = 1
+        transformSelectedLines { line, _ in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return line }
+            let stripped = line.replacingOccurrences(
+                of: #"^\s*(?:[-*+]\s+|\d+\.\s+)"#,
+                with: "",
+                options: .regularExpression
+            )
+            defer { itemIndex += 1 }
+            return "\(itemIndex). " + stripped.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private func applyBlockquote() {
+        transformSelectedLines { line, _ in
+            let stripped = line.replacingOccurrences(
+                of: #"^\s*>\s?"#,
+                with: "",
+                options: .regularExpression
+            )
+            if stripped.trimmingCharacters(in: .whitespaces).isEmpty {
+                return line
+            }
+            return "> " + stripped
+        }
+    }
+
+    private func applyEscapedCharacters() {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let escapeSet: Set<Character> = Set("\\`*_{}[]()#+-.!~>|")
+
+        guard selection.length > 0 else {
+            let replacement = "\\"
+            guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+            textStorage?.replaceCharacters(in: selection, with: replacement)
+            didChangeText()
+            setSelectedRange(NSRange(location: selection.location + 1, length: 0))
+            scheduleStyling(reason: .textChanged)
+            return
+        }
+
+        let selectedText = nsText.substring(with: selection)
+        var escaped = ""
+        escaped.reserveCapacity(selectedText.count * 2)
+        for character in selectedText {
+            if escapeSet.contains(character) {
+                escaped.append("\\")
+            }
+            escaped.append(character)
+        }
+
+        guard shouldChangeText(in: selection, replacementString: escaped) else { return }
+        textStorage?.replaceCharacters(in: selection, with: escaped)
+        didChangeText()
+        setSelectedRange(NSRange(location: selection.location, length: (escaped as NSString).length))
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func insertMarkdownLink() {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+
+        let defaultURL = "https://example.com"
+        if selection.length > 0 {
+            let selectedText = nsText.substring(with: selection)
+            let replacement = "[\(selectedText)](\(defaultURL))"
+            guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+            textStorage?.replaceCharacters(in: selection, with: replacement)
+            didChangeText()
+            let urlLocation = selection.location + (selectedText as NSString).length + 3
+            setSelectedRange(NSRange(location: urlLocation, length: (defaultURL as NSString).length))
+            scheduleStyling(reason: .textChanged)
+            return
+        }
+
+        let replacement = "[link text](\(defaultURL))"
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+        setSelectedRange(NSRange(location: selection.location + 1, length: ("link text" as NSString).length))
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func insertCodeBlock() {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let selectedText = selection.length > 0 ? nsText.substring(with: selection) : ""
+
+        let replacement: String
+        let cursorRange: NSRange
+        if selection.length > 0 {
+            replacement = "```\n\(selectedText)\n```"
+            cursorRange = NSRange(location: selection.location + 4, length: (selectedText as NSString).length)
+        } else {
+            replacement = "```\n\n```"
+            cursorRange = NSRange(location: selection.location + 4, length: 0)
+        }
+
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+        setSelectedRange(cursorRange)
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func insertFootnote() {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let footnoteID = nextFootnoteID()
+        let marker = "[^\(footnoteID)]"
+
+        if selection.length > 0 {
+            let selected = nsText.substring(with: selection)
+            let replacement = selected + marker
+            guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+            textStorage?.replaceCharacters(in: selection, with: replacement)
+            didChangeText()
+            setSelectedRange(NSRange(location: selection.location + (replacement as NSString).length, length: 0))
+        } else {
+            guard shouldChangeText(in: selection, replacementString: marker) else { return }
+            textStorage?.replaceCharacters(in: selection, with: marker)
+            didChangeText()
+            setSelectedRange(NSRange(location: selection.location + (marker as NSString).length, length: 0))
+        }
+
+        let definitionPrefix = "[^\(footnoteID)]: "
+        let current = string
+        if !current.contains(definitionPrefix) {
+            let appendNeedsNewline = !current.hasSuffix("\n")
+            let definitionBlock = appendNeedsNewline ? "\n\n\(definitionPrefix)" : "\n\(definitionPrefix)"
+            let insertLocation = (string as NSString).length
+            let appendRange = NSRange(location: insertLocation, length: 0)
+            guard shouldChangeText(in: appendRange, replacementString: definitionBlock) else {
+                scheduleStyling(reason: .textChanged)
+                return
+            }
+            textStorage?.replaceCharacters(in: appendRange, with: definitionBlock)
+            didChangeText()
+            setSelectedRange(
+                NSRange(
+                    location: insertLocation + (definitionBlock as NSString).length,
+                    length: 0
+                )
+            )
+        }
+
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func insertTable(rows: Int, columns: Int) {
+        let safeRows = min(max(rows, 1), 20)
+        let safeColumns = min(max(columns, 1), 20)
+
+        let headerCells = (1...safeColumns).map { "Column \($0)" }
+        let dividerCells = Array(repeating: "---", count: safeColumns)
+        let bodyCells = Array(repeating: " ", count: safeColumns)
+
+        var lines: [String] = []
+        lines.append("| " + headerCells.joined(separator: " | ") + " |")
+        lines.append("| " + dividerCells.joined(separator: " | ") + " |")
+        for _ in 0..<safeRows {
+            lines.append("| " + bodyCells.joined(separator: " | ") + " |")
+        }
+
+        let block = lines.joined(separator: "\n")
+        let nsText = string as NSString
+        let selection = Self.clamp(range: selectedRange(), upperBound: nsText.length)
+
+        let needsLeadingSpacing: Bool
+        if selection.location == 0 {
+            needsLeadingSpacing = false
+        } else {
+            let previousChar = nsText.substring(with: NSRange(location: selection.location - 1, length: 1))
+            needsLeadingSpacing = previousChar != "\n"
+        }
+
+        let prefix = needsLeadingSpacing ? "\n\n" : ""
+        let suffix = "\n"
+        let replacement = prefix + block + suffix
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+
+        let headerLength = (lines[0] as NSString).length
+        let dividerLength = (lines[1] as NSString).length
+        let cursorLocation = selection.location + (prefix as NSString).length + headerLength + 1 + dividerLength + 1 + 2
+        setSelectedRange(NSRange(location: cursorLocation, length: 0))
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func nextFootnoteID() -> Int {
+        let pattern = #"\[\^(\d+)\]"#
+        let regex = try? NSRegularExpression(pattern: pattern, options: [])
+        let fullRange = NSRange(location: 0, length: (string as NSString).length)
+        let matches = regex?.matches(in: string, options: [], range: fullRange) ?? []
+
+        var maxID = 0
+        for match in matches {
+            guard match.numberOfRanges > 1 else { continue }
+            let numberRange = match.range(at: 1)
+            guard numberRange.location != NSNotFound else { continue }
+            let token = (string as NSString).substring(with: numberRange)
+            if let value = Int(token) {
+                maxID = max(maxID, value)
+            }
+        }
+        return maxID + 1
+    }
+
+    private func transformSelectedLines(_ transform: (String, Int) -> String) {
+        let nsText = string as NSString
+        let totalLength = nsText.length
+
+        let sourceSelection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let lineQueryRange: NSRange
+        if totalLength == 0 {
+            lineQueryRange = NSRange(location: 0, length: 0)
+        } else {
+            let safeLocation = min(sourceSelection.location, max(totalLength - 1, 0))
+            lineQueryRange = NSRange(location: safeLocation, length: sourceSelection.length)
+        }
+        let lineRange = totalLength == 0 ? NSRange(location: 0, length: 0) : nsText.lineRange(for: lineQueryRange)
+
+        let block = lineRange.length > 0 ? nsText.substring(with: lineRange) : ""
+        let lines = (lineRange.length > 0 ? block : "").components(separatedBy: "\n")
+        let hasTrailingNewline = block.hasSuffix("\n")
+
+        let transformed = lines.enumerated().map { index, line -> String in
+            let isTrailingSentinel = hasTrailingNewline && index == lines.count - 1 && line.isEmpty
+            if isTrailingSentinel {
+                return line
+            }
+            return transform(line, index)
+        }
+        let replacement = transformed.joined(separator: "\n")
+
+        guard shouldChangeText(in: lineRange, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: lineRange, with: replacement)
+        didChangeText()
+        setSelectedRange(NSRange(location: lineRange.location, length: (replacement as NSString).length))
         scheduleStyling(reason: .textChanged)
     }
 

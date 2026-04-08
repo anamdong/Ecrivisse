@@ -1,5 +1,16 @@
 import SwiftUI
 import AppKit
+import Carbon
+
+struct ExternalWindowRequest: Codable, Hashable {
+    let path: String
+    let token: UUID
+
+    init(path: String, token: UUID = UUID()) {
+        self.path = path
+        self.token = token
+    }
+}
 
 @main
 struct EcrivisseApp: App {
@@ -8,8 +19,8 @@ struct EcrivisseApp: App {
     private let minimumContentHeight: CGFloat = 420
 
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        WindowGroup(for: ExternalWindowRequest.self) { externalFileRequest in
+            ContentView(initialExternalFilePath: externalFileRequest.wrappedValue?.path)
                 .frame(minWidth: minimumContentWidth, minHeight: minimumContentHeight)
         }
         .defaultSize(width: 980, height: 700)
@@ -21,6 +32,18 @@ struct EcrivisseApp: App {
 }
 
 final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
+    private static let openDocumentsEventClass = AEEventClass(kCoreEventClass)
+    private static let openDocumentsEventID = AEEventID(kAEOpenDocuments)
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleOpenDocumentsEvent(_:withReplyEvent:)),
+            forEventClass: Self.openDocumentsEventClass,
+            andEventID: Self.openDocumentsEventID
+        )
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Finder/Open-With can launch the app with file paths in argv before
         // regular open-file delegate callbacks are observed.
@@ -48,6 +71,29 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
         enqueue(urls: urls)
     }
 
+    @objc
+    private func handleOpenDocumentsEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor?) {
+        guard let descriptorList = event.paramDescriptor(forKeyword: keyDirectObject) else { return }
+        let itemCount = descriptorList.numberOfItems
+        guard itemCount > 0 else { return }
+
+        var urls: [URL] = []
+        urls.reserveCapacity(itemCount)
+
+        for index in 1...itemCount {
+            guard let descriptor = descriptorList.atIndex(index) else { continue }
+            if let fileURL = descriptor.fileURLValue {
+                urls.append(fileURL)
+                continue
+            }
+            if let path = descriptor.stringValue, !path.isEmpty {
+                urls.append(URL(fileURLWithPath: path))
+            }
+        }
+
+        enqueue(urls: urls)
+    }
+
     private func enqueue(urls: [URL]) {
         guard !urls.isEmpty else { return }
         Task { @MainActor in
@@ -59,6 +105,7 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func revealWindowForExternalOpen(retryCount: Int = 0) {
         NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
 
         if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isExcludedFromWindowsMenu }) ?? NSApp.windows.first {
@@ -67,11 +114,20 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
             }
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
+            for sibling in NSApp.windows where sibling !== window {
+                if sibling.isMiniaturized {
+                    sibling.deminiaturize(nil)
+                }
+                sibling.orderFront(nil)
+            }
             return
         }
 
-        if retryCount == 8 {
-            _ = NSApp.sendAction(#selector(NSDocumentController.newDocument(_:)), to: nil, from: nil)
+        if retryCount == 0 {
+            let createdWindow = NSApp.sendAction(NSSelectorFromString("newWindow:"), to: nil, from: nil)
+            if createdWindow {
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
 
         guard retryCount < 30 else { return }

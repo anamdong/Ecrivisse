@@ -11,9 +11,9 @@
   <key>CFBundleIdentifier</key>
   <string>com.ecrivisse.app</string>
   <key>CFBundleVersion</key>
-  <string>13</string>
+  <string>14</string>
   <key>CFBundleShortVersionString</key>
-  <string>beta 1.3</string>
+  <string>Beta 1.4</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleIconFile</key>

@@ -35,8 +35,8 @@ enum DocumentExporter {
         try makeAttributedMarkdown(markdown: markdown)
     }
 
-    static func exportHTML(markdown: String, to url: URL) throws {
-        let html = MarkdownWebRenderer.htmlDocument(from: markdown)
+    static func exportHTML(markdown: String, to url: URL, previewFont: PreviewFontOption = .systemSans) throws {
+        let html = MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont)
         guard let data = html.data(using: .utf8) else {
             throw DocumentExporterError.markdownParseFailed
         }
@@ -44,14 +44,14 @@ enum DocumentExporter {
     }
 
     @MainActor
-    static func exportPDF(markdown: String, to url: URL) async throws {
-        let data = try await previewPDFData(markdown: markdown)
+    static func exportPDF(markdown: String, to url: URL, previewFont: PreviewFontOption = .systemSans) async throws {
+        let data = try await previewPDFData(markdown: markdown, previewFont: previewFont)
         try data.write(to: url, options: .atomic)
     }
 
     @MainActor
-    static func printPreview(markdown: String) async throws {
-        let data = try await previewPDFData(markdown: markdown)
+    static func printPreview(markdown: String, previewFont: PreviewFontOption = .systemSans) async throws {
+        let data = try await previewPDFData(markdown: markdown, previewFont: previewFont)
         guard let document = PDFDocument(data: data) else {
             throw DocumentExporterError.pdfDocumentCreationFailed
         }
@@ -164,7 +164,7 @@ enum DocumentExporter {
     }
 
     @MainActor
-    private static func makeLoadedPreviewWebView(markdown: String) async throws -> WKWebView {
+    private static func makeLoadedPreviewWebView(markdown: String, previewFont: PreviewFontOption) async throws -> WKWebView {
         let config = WKWebViewConfiguration()
         let webView = WKWebView(
             frame: NSRect(x: 0, y: 0, width: previewViewportWidth, height: previewViewportHeight),
@@ -174,14 +174,14 @@ enum DocumentExporter {
 
         let loader = PreviewLoadObserver()
         webView.navigationDelegate = loader
-        webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown), baseURL: nil)
+        webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
         try await loader.waitUntilLoaded()
         return webView
     }
 
     @MainActor
-    private static func previewPDFData(markdown: String) async throws -> Data {
-        let webView = try await makeLoadedPreviewWebView(markdown: markdown)
+    private static func previewPDFData(markdown: String, previewFont: PreviewFontOption) async throws -> Data {
+        let webView = try await makeLoadedPreviewWebView(markdown: markdown, previewFont: previewFont)
         let contentHeight = try await measurePreviewContentHeight(in: webView)
         let exportHeight = max(previewViewportHeight, contentHeight)
 

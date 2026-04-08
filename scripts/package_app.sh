@@ -5,7 +5,7 @@ EXECUTABLE_NAME="Ecrivisse"
 APP_DISPLAY_NAME="Écrivisse"
 APP_BUNDLE_NAME="Écrivisse"
 APP_BUNDLE_ID="com.ecrivisse.app"
-APP_ICON_PNG_RELATIVE_PATH="app_icon/1x/Ecrivisse_icon_03.png"
+APP_ICON_PNG_RELATIVE_PATH="app_icon/1x/CrawfishWriter_icon_04.png"
 APP_ICON_BASENAME="Ecrivisse"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -72,9 +72,9 @@ cat > "$INFO_PLIST" <<EOF
   <key>CFBundleIdentifier</key>
   <string>$APP_BUNDLE_ID</string>
   <key>CFBundleVersion</key>
-  <string>13</string>
+  <string>14</string>
   <key>CFBundleShortVersionString</key>
-  <string>beta 1.3</string>
+  <string>Beta 1.4</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleIconFile</key>

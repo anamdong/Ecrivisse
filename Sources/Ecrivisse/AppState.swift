@@ -9,6 +9,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
     @Published var focusMode: FocusMode = .off
     @Published var editorFontSize: CGFloat = 17
     @Published var useDarkMode: Bool = false
+    @Published var previewFontOption: PreviewFontOption = .serif
     @Published var summarizeDocumentRequestID: Int = 0
     @Published var documentURL: URL? {
         didSet { refreshWindowDocumentMetadata() }
@@ -25,6 +26,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
     private let minimumWindowFrameSize = NSSize(width: 660, height: 500)
     private let minimumWindowContentSize = NSSize(width: 620, height: 420)
     private var isProgrammaticCloseInProgress = false
+    private var shouldRevealWhenWindowConfigures = false
 
     var canExportDOCX: Bool {
         if #available(macOS 13.0, *) {
@@ -73,6 +75,11 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         if let configuredWindow {
             applyAppearance(to: configuredWindow)
         }
+    }
+
+    func applyEditorAction(_ action: MarkdownEditorAction) {
+        guard let textView = activeWriterTextView() else { return }
+        textView.applyMarkdownAction(action)
     }
 
     func requestDocumentSummaryUsingAI() {
@@ -133,6 +140,10 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
 
         applyAppearance(to: window)
         refreshWindowDocumentMetadata()
+        if shouldRevealWhenWindowConfigures || ExternalFileOpenRouter.shared.hasPendingFileURLs {
+            shouldRevealWhenWindowConfigures = false
+            reveal(window: window)
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -199,6 +210,27 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         var adjustedFrame = window.frame
         adjustedFrame.size = NSSize(width: adjustedFrameWidth, height: adjustedFrameHeight)
         window.setFrame(adjustedFrame, display: true)
+    }
+
+    func revealConfiguredWindow() {
+        guard let configuredWindow else {
+            shouldRevealWhenWindowConfigures = true
+            return
+        }
+        shouldRevealWhenWindowConfigures = false
+        reveal(window: configuredWindow)
+    }
+
+    private func reveal(window: NSWindow) {
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     private func refreshWindowDocumentMetadata() {
@@ -283,10 +315,11 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let markdown = text
+        let previewFont = previewFontOption
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                try await DocumentExporter.exportPDF(markdown: markdown, to: url)
+                try await DocumentExporter.exportPDF(markdown: markdown, to: url, previewFont: previewFont)
             } catch {
                 self.present(error: error)
             }
@@ -303,7 +336,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         do {
-            try DocumentExporter.exportHTML(markdown: text, to: url)
+            try DocumentExporter.exportHTML(markdown: text, to: url, previewFont: previewFontOption)
         } catch {
             present(error: error)
         }
@@ -331,10 +364,11 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
 
     func printDocument() {
         let markdown = text
+        let previewFont = previewFontOption
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                try await DocumentExporter.printPreview(markdown: markdown)
+                try await DocumentExporter.printPreview(markdown: markdown, previewFont: previewFont)
             } catch {
                 self.present(error: error)
             }
@@ -430,6 +464,32 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
             return value
         }
         throw AppStateError.unreadableTextEncoding
+    }
+
+    private func activeWriterTextView() -> WriterTextView? {
+        if let firstResponder = configuredWindow?.firstResponder as? WriterTextView {
+            return firstResponder
+        }
+
+        let candidateWindow = configuredWindow ?? NSApp.keyWindow ?? NSApp.mainWindow
+        if let firstResponder = candidateWindow?.firstResponder as? WriterTextView {
+            return firstResponder
+        }
+
+        return findWriterTextView(in: candidateWindow?.contentView)
+    }
+
+    private func findWriterTextView(in view: NSView?) -> WriterTextView? {
+        guard let view else { return nil }
+        if let writerTextView = view as? WriterTextView {
+            return writerTextView
+        }
+        for child in view.subviews {
+            if let match = findWriterTextView(in: child) {
+                return match
+            }
+        }
+        return nil
     }
 
     private func loadDocument(at url: URL, shouldConfirmDiscard: Bool) throws {

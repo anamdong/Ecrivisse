@@ -9,6 +9,10 @@ final class ExternalFileOpenRouter: ObservableObject {
 
     private init() {}
 
+    var hasPendingFileURLs: Bool {
+        !pendingFileURLs.isEmpty
+    }
+
     func enqueue(urls: [URL]) {
         let validFileURLs = urls.compactMap { url -> URL? in
             guard url.isFileURL else { return nil }
@@ -18,10 +22,22 @@ final class ExternalFileOpenRouter: ObservableObject {
                 return nil
             }
 
-            return url
+            return url.standardizedFileURL
         }
+
         guard !validFileURLs.isEmpty else { return }
-        pendingFileURLs.append(contentsOf: validFileURLs)
+
+        var known: Set<String> = Set(pendingFileURLs.map(\.path))
+        var insertedAny = false
+        for url in validFileURLs {
+            let key = url.path
+            guard !known.contains(key) else { continue }
+            pendingFileURLs.append(url)
+            known.insert(key)
+            insertedAny = true
+        }
+
+        guard insertedAny else { return }
         eventID &+= 1
     }
 

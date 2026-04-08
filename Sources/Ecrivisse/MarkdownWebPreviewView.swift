@@ -6,6 +6,9 @@ private let previewHoverMessageHandlerName = "ecrivissePreviewHover"
 
 struct MarkdownWebPreviewView: NSViewRepresentable {
     let markdown: String
+    let previewFont: PreviewFontOption
+    let editorFollowRatio: Double
+    let editorFollowEventID: Int
     var onHorizontalSwipe: (CGFloat) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -39,8 +42,13 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         DispatchQueue.main.async {
             configureOverlayScrollbars(for: webView)
         }
-        webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown), baseURL: nil)
-        context.coordinator.markInitiallyRendered(markdown: markdown)
+        webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
+        context.coordinator.markInitiallyRendered(
+            markdown: markdown,
+            previewFont: previewFont,
+            editorFollowRatio: editorFollowRatio,
+            editorFollowEventID: editorFollowEventID
+        )
         return webView
     }
 
@@ -51,7 +59,13 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
             !(coordinator?.isHoveringScrollableCodeBlock ?? false)
         }
         configureOverlayScrollbars(for: nsView)
-        context.coordinator.render(markdown: markdown, in: nsView)
+        context.coordinator.render(
+            markdown: markdown,
+            previewFont: previewFont,
+            editorFollowRatio: editorFollowRatio,
+            editorFollowEventID: editorFollowEventID,
+            in: nsView
+        )
     }
 
     private func configureOverlayScrollbars(for webView: WKWebView) {
@@ -79,23 +93,58 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         private var lastMarkdown: String = ""
+        private var lastPreviewFont: PreviewFontOption = .systemSans
+        private var pendingEditorFollow: (eventID: Int, ratio: Double)?
+        private var lastAppliedEditorFollowEventID: Int = -1
         var isHoveringScrollableCodeBlock: Bool = false
 
-        func markInitiallyRendered(markdown: String) {
+        func markInitiallyRendered(
+            markdown: String,
+            previewFont: PreviewFontOption,
+            editorFollowRatio: Double,
+            editorFollowEventID: Int
+        ) {
             lastMarkdown = markdown
+            lastPreviewFont = previewFont
+            queueEditorFollow(ratio: editorFollowRatio, eventID: editorFollowEventID)
         }
 
-        func render(markdown: String, in webView: WKWebView) {
-            guard markdown != lastMarkdown else { return }
+        func render(
+            markdown: String,
+            previewFont: PreviewFontOption,
+            editorFollowRatio: Double,
+            editorFollowEventID: Int,
+            in webView: WKWebView
+        ) {
+            queueEditorFollow(ratio: editorFollowRatio, eventID: editorFollowEventID)
+
+            if previewFont != lastPreviewFont {
+                lastPreviewFont = previewFont
+                lastMarkdown = markdown
+                webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
+                return
+            }
+
+            if markdown == lastMarkdown {
+                applyPendingEditorFollow(in: webView)
+                return
+            }
             lastMarkdown = markdown
             let bodyHTML = MarkdownWebRenderer.htmlBody(from: markdown)
             let encodedBodyHTML = Self.javaScriptStringLiteral(bodyHTML)
-            let script = "window.ecrivisseUpdateBody(\(encodedBodyHTML));"
+            let pendingFollowEventID = pendingEditorFollow?.eventID
+            let ratioLiteral = pendingEditorFollow.map { Self.javaScriptNumberLiteral($0.ratio) } ?? "null"
+            let shouldFollowLiteral = pendingFollowEventID == nil ? "false" : "true"
+            let script = "window.ecrivisseUpdateBody(\(encodedBodyHTML), \(ratioLiteral), \(shouldFollowLiteral));"
 
-            webView.evaluateJavaScript(script) { [weak webView] _, error in
-                guard let webView else { return }
+            webView.evaluateJavaScript(script) { [weak self, weak webView] _, error in
+                guard let self, let webView else { return }
                 if error != nil {
-                    webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown), baseURL: nil)
+                    webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
+                    return
+                }
+                if let pendingFollowEventID {
+                    self.consumeEditorFollow(eventID: pendingFollowEventID)
                 }
             }
         }
@@ -114,7 +163,7 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // no-op; kept for future preview lifecycle handling.
+            applyPendingEditorFollow(in: webView)
         }
 
         private static func javaScriptStringLiteral(_ value: String) -> String {
@@ -123,6 +172,34 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
                 return encoded
             }
             return "\"\""
+        }
+
+        private static func javaScriptNumberLiteral(_ value: Double) -> String {
+            guard value.isFinite else { return "0" }
+            return String(format: "%.8f", max(0, min(1, value)))
+        }
+
+        private func queueEditorFollow(ratio: Double, eventID: Int) {
+            guard eventID > lastAppliedEditorFollowEventID else { return }
+            pendingEditorFollow = (eventID: eventID, ratio: max(0, min(1, ratio)))
+        }
+
+        private func consumeEditorFollow(eventID: Int) {
+            guard let pending = pendingEditorFollow else { return }
+            guard pending.eventID == eventID else { return }
+            lastAppliedEditorFollowEventID = max(lastAppliedEditorFollowEventID, eventID)
+            pendingEditorFollow = nil
+        }
+
+        private func applyPendingEditorFollow(in webView: WKWebView) {
+            guard let pending = pendingEditorFollow else { return }
+            let ratioLiteral = Self.javaScriptNumberLiteral(pending.ratio)
+            let script = "window.ecrivisseScrollToRatio(\(ratioLiteral));"
+
+            webView.evaluateJavaScript(script) { [weak self] _, error in
+                guard error == nil else { return }
+                self?.consumeEditorFollow(eventID: pending.eventID)
+            }
         }
     }
 
@@ -269,8 +346,9 @@ enum MarkdownWebRenderer {
         var title: String?
     }
 
-    static func htmlDocument(from markdown: String) -> String {
+    static func htmlDocument(from markdown: String, previewFont: PreviewFontOption = .systemSans) -> String {
         let bodyHTML = makeHTMLBody(from: markdown)
+        let previewFontStack = previewFont.cssFontStack
         return """
         <!doctype html>
         <html lang="en">
@@ -302,7 +380,7 @@ enum MarkdownWebRenderer {
               padding: 0;
               background: var(--bg);
               color: var(--fg);
-              font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+              font-family: \(previewFontStack);
               font-size: 15px;
               line-height: 1.65;
             }
@@ -448,7 +526,17 @@ enum MarkdownWebRenderer {
             }
           </style>
           <script>
-            window.ecrivisseUpdateBody = (rawHTML) => {
+            window.ecrivisseScrollToRatio = (ratio) => {
+              const safeRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+              const doc = document.documentElement;
+              const body = document.body;
+              const maxHeight = Math.max(doc.scrollHeight || 0, body.scrollHeight || 0);
+              const viewport = window.innerHeight || doc.clientHeight || 0;
+              const maxOffset = Math.max(maxHeight - viewport, 0);
+              window.scrollTo(0, maxOffset * safeRatio);
+            };
+
+            window.ecrivisseUpdateBody = (rawHTML, editorRatio = null, shouldFollowEditor = false) => {
               const main = document.querySelector("main.wrap");
               if (!main) { return; }
 
@@ -459,6 +547,10 @@ enum MarkdownWebRenderer {
               main.innerHTML = rawHTML;
 
               const restoreScroll = () => {
+                if (shouldFollowEditor && Number.isFinite(editorRatio)) {
+                  window.ecrivisseScrollToRatio(editorRatio);
+                  return;
+                }
                 const maxHeight = Math.max(doc.scrollHeight || 0, body.scrollHeight || 0);
                 const viewport = window.innerHeight || doc.clientHeight || 0;
                 const maxOffset = Math.max(maxHeight - viewport, 0);
