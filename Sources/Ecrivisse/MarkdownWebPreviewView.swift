@@ -528,12 +528,63 @@ enum MarkdownWebRenderer {
           <script>
             window.ecrivisseScrollToRatio = (ratio) => {
               const safeRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+              let calibratedRatio = safeRatio;
+              if (safeRatio > 0 && safeRatio < 0.25) {
+                const topT = safeRatio / 0.25;
+                calibratedRatio = Math.max(0, safeRatio - ((1 - topT) * 0.028));
+              }
               const doc = document.documentElement;
               const body = document.body;
               const maxHeight = Math.max(doc.scrollHeight || 0, body.scrollHeight || 0);
               const viewport = window.innerHeight || doc.clientHeight || 0;
               const maxOffset = Math.max(maxHeight - viewport, 0);
-              window.scrollTo(0, maxOffset * safeRatio);
+              const targetOffset = maxOffset * calibratedRatio;
+              const currentOffset = window.scrollY || doc.scrollTop || body.scrollTop || 0;
+              if (Math.abs(targetOffset - currentOffset) < 8) {
+                return;
+              }
+              window.scrollTo(0, targetOffset);
+            };
+
+            window.ecrivisseCaptureExistingImages = (root) => {
+              const pool = new Map();
+              if (!root) { return pool; }
+              const images = root.querySelectorAll("img");
+              images.forEach((img) => {
+                const key = [
+                  img.getAttribute("src") || "",
+                  img.getAttribute("alt") || "",
+                  img.getAttribute("title") || ""
+                ].join("\\u0001");
+                if (!pool.has(key)) {
+                  pool.set(key, []);
+                }
+                pool.get(key).push(img);
+              });
+              return pool;
+            };
+
+            window.ecrivisseRestoreExistingImages = (root, pool) => {
+              if (!root || !pool) { return; }
+              const images = root.querySelectorAll("img");
+              images.forEach((newImg) => {
+                const key = [
+                  newImg.getAttribute("src") || "",
+                  newImg.getAttribute("alt") || "",
+                  newImg.getAttribute("title") || ""
+                ].join("\\u0001");
+                const candidates = pool.get(key);
+                if (!candidates || candidates.length === 0) { return; }
+
+                const existingImg = candidates.shift();
+                if (!existingImg) { return; }
+
+                existingImg.className = newImg.className;
+                existingImg.style.cssText = newImg.style.cssText;
+                if (newImg.width) { existingImg.width = newImg.width; }
+                if (newImg.height) { existingImg.height = newImg.height; }
+                newImg.replaceWith(existingImg);
+              });
             };
 
             window.ecrivisseUpdateBody = (rawHTML, editorRatio = null, shouldFollowEditor = false) => {
@@ -543,8 +594,10 @@ enum MarkdownWebRenderer {
               const doc = document.documentElement;
               const body = document.body;
               const previousOffset = window.scrollY || doc.scrollTop || body.scrollTop || 0;
+              const existingImagePool = window.ecrivisseCaptureExistingImages(main);
 
               main.innerHTML = rawHTML;
+              window.ecrivisseRestoreExistingImages(main, existingImagePool);
 
               const restoreScroll = () => {
                 if (shouldFollowEditor && Number.isFinite(editorRatio)) {
