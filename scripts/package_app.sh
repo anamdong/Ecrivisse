@@ -72,9 +72,9 @@ cat > "$INFO_PLIST" <<EOF
   <key>CFBundleIdentifier</key>
   <string>$APP_BUNDLE_ID</string>
   <key>CFBundleVersion</key>
-  <string>14</string>
+  <string>15</string>
   <key>CFBundleShortVersionString</key>
-  <string>Beta 1.4</string>
+  <string>Beta 1.5</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleIconFile</key>

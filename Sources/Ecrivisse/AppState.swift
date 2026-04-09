@@ -4,12 +4,27 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppState: NSObject, ObservableObject, NSWindowDelegate {
+    static let defaultEditorCursorNSColor: NSColor = NSColor(
+        calibratedRed: 1.0,
+        green: 0.302,
+        blue: 0.251,
+        alpha: 1.0
+    ) // #ff4d40
+    static let defaultEditorCursorColor: Color = Color(nsColor: defaultEditorCursorNSColor)
+    private static let useDarkModeDefaultsKey = "ecrivisse.useDarkMode"
+
     @Published var text: String = ""
     @Published var isPreviewPanelVisible: Bool = false
     @Published var focusMode: FocusMode = .off
     @Published var editorFontSize: CGFloat = 17
-    @Published var useDarkMode: Bool = false
+    @Published var useDarkMode: Bool = UserDefaults.standard.object(forKey: AppState.useDarkModeDefaultsKey) as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(useDarkMode, forKey: Self.useDarkModeDefaultsKey)
+        }
+    }
     @Published var previewFontOption: PreviewFontOption = .serif
+    @Published var floatingToolbarPosition: FloatingToolbarPosition = .bottom
+    @Published private var editorCursorColorHexStorage: String = AppState.defaultEditorCursorColorHex
     @Published var summarizeDocumentRequestID: Int = 0
     @Published var documentURL: URL? {
         didSet { refreshWindowDocumentMetadata() }
@@ -23,10 +38,40 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
     let minimumEditorFontSize: CGFloat = 12
     let maximumEditorFontSize: CGFloat = 30
     private let defaultDocumentTitle = "Untitled.md"
-    private let minimumWindowFrameSize = NSSize(width: 660, height: 500)
-    private let minimumWindowContentSize = NSSize(width: 620, height: 420)
+    private let minimumWindowFrameSize = NSSize(width: 860, height: 560)
+    private let minimumWindowContentSize = NSSize(width: 820, height: 500)
     private var isProgrammaticCloseInProgress = false
     private var shouldRevealWhenWindowConfigures = false
+    private static let taskListMarkerRegex = try! NSRegularExpression(
+        pattern: #"(?m)^([ \t]*[-+*][ \t]+\[)([ xX])(\][ \t]*)"#,
+        options: []
+    )
+    private static let supportedOpenFileExtensions: [String] = [
+        "md", "markdown", "txt", "text", "rtf",
+        "html", "htm", "xml", "json", "csv", "tsv",
+        "log", "yaml", "yml"
+    ]
+    private static let supportedOpenFileExtensionSet: Set<String> = Set(supportedOpenFileExtensions)
+
+    static var supportedSidebarFileExtensions: Set<String> {
+        supportedOpenFileExtensionSet
+    }
+
+    static var defaultEditorCursorColorHex: String {
+        cssHexString(from: defaultEditorCursorNSColor)
+    }
+
+    var editorCursorColorHex: String {
+        editorCursorColorHexStorage
+    }
+
+    var editorCursorNSColor: NSColor {
+        Self.nsColor(from: editorCursorColorHexStorage)
+    }
+
+    var editorCursorColor: Color {
+        Color(nsColor: editorCursorNSColor)
+    }
 
     var canExportDOCX: Bool {
         if #available(macOS 13.0, *) {
@@ -40,6 +85,31 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
             text = newValue
         }
         isDirty = true
+    }
+
+    func setTaskListItemChecked(at index: Int, checked: Bool) {
+        guard index >= 0 else { return }
+
+        if let textView = activeWriterTextView(),
+           textView.setTaskListItemChecked(at: index, checked: checked) {
+            let updatedText = textView.string
+            if text != updatedText {
+                text = updatedText
+            }
+            isDirty = true
+            return
+        }
+
+        let updated = Self.markdownBySettingTaskItem(in: text, index: index, checked: checked)
+        guard updated != text else { return }
+        text = updated
+        isDirty = true
+    }
+
+    func scrollEditorToSourceLine(_ line: Int) {
+        guard line >= 0 else { return }
+        guard let textView = activeWriterTextView() else { return }
+        textView.scrollToSourceLine(line)
     }
 
     func togglePreviewPanel() {
@@ -77,6 +147,18 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         }
     }
 
+    func setEditorCursorColor(_ color: Color) {
+        setEditorCursorNSColor(NSColor(color))
+    }
+
+    func setEditorCursorNSColor(_ color: NSColor) {
+        editorCursorColorHexStorage = Self.cssHexString(from: color)
+    }
+
+    func resetEditorCursorColorToDefault() {
+        editorCursorColorHexStorage = Self.defaultEditorCursorColorHex
+    }
+
     func applyEditorAction(_ action: MarkdownEditorAction) {
         guard let textView = activeWriterTextView() else { return }
         textView.applyMarkdownAction(action)
@@ -111,11 +193,12 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
             window.titleVisibility = .visible
             window.titlebarAppearsTransparent = true
             window.toolbar = nil
-            window.tabbingMode = .disallowed
+            window.tabbingMode = .preferred
+            window.tabbingIdentifier = "ecrivisse-document"
             window.isMovableByWindowBackground = true
             window.collectionBehavior.insert(.fullScreenPrimary)
             window.collectionBehavior.insert(.fullScreenAllowsTiling)
-            window.backgroundColor = .textBackgroundColor
+            window.backgroundColor = windowChromeBackgroundColor
             if #available(macOS 11.0, *) {
                 window.titlebarSeparatorStyle = .none
             }
@@ -197,7 +280,14 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
 
     private func applyAppearance(to window: NSWindow) {
         window.appearance = NSAppearance(named: useDarkMode ? .darkAqua : .aqua)
-        window.backgroundColor = .windowBackgroundColor
+        window.backgroundColor = windowChromeBackgroundColor
+    }
+
+    private var windowChromeBackgroundColor: NSColor {
+        if useDarkMode {
+            return .textBackgroundColor
+        }
+        return NSColor(calibratedWhite: 0.95, alpha: 1.0)
     }
 
     private func clampWindowSizeIfNeeded(_ window: NSWindow) {
@@ -210,6 +300,66 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         var adjustedFrame = window.frame
         adjustedFrame.size = NSSize(width: adjustedFrameWidth, height: adjustedFrameHeight)
         window.setFrame(adjustedFrame, display: true)
+    }
+
+    func windowForTabOperations() -> NSWindow? {
+        configuredWindow ?? NSApp.keyWindow ?? NSApp.mainWindow
+    }
+
+    func requestNewTab() {
+        NSWindow.allowsAutomaticWindowTabbing = true
+        guard let sourceWindow = windowForTabOperations() else {
+            _ = NSApp.sendAction(NSSelectorFromString("newWindow:"), to: nil, from: nil)
+            return
+        }
+        sourceWindow.tabbingMode = .preferred
+        sourceWindow.tabbingIdentifier = "ecrivisse-document"
+
+        let existingWindowIDs = Set(NSApp.windows.map(ObjectIdentifier.init))
+        if !NSApp.sendAction(NSSelectorFromString("newWindowForTab:"), to: nil, from: nil) {
+            _ = NSApp.sendAction(NSSelectorFromString("newWindow:"), to: nil, from: nil)
+        }
+
+        attachCreatedWindowAsTab(
+            sourceWindow: sourceWindow,
+            existingWindowIDs: existingWindowIDs
+        )
+    }
+
+    private func attachCreatedWindowAsTab(
+        sourceWindow: NSWindow,
+        existingWindowIDs: Set<ObjectIdentifier>,
+        retryCount: Int = 0
+    ) {
+        let candidateWindows = NSApp.windows.filter { window in
+            window !== sourceWindow &&
+            !existingWindowIDs.contains(ObjectIdentifier(window)) &&
+            window.canBecomeMain &&
+            !window.isExcludedFromWindowsMenu
+        }
+
+        if let targetWindow = candidateWindows.first {
+            targetWindow.tabbingMode = .preferred
+            targetWindow.tabbingIdentifier = "ecrivisse-document"
+
+            if targetWindow.tabGroup !== sourceWindow.tabGroup {
+                sourceWindow.addTabbedWindow(targetWindow, ordered: .above)
+            }
+
+            NSApp.unhide(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            targetWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        guard retryCount < 40 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.attachCreatedWindowAsTab(
+                sourceWindow: sourceWindow,
+                existingWindowIDs: existingWindowIDs,
+                retryCount: retryCount + 1
+            )
+        }
     }
 
     func revealConfiguredWindow() {
@@ -466,6 +616,28 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         throw AppStateError.unreadableTextEncoding
     }
 
+    private static func markdownBySettingTaskItem(in source: String, index: Int, checked: Bool) -> String {
+        let nsSource = source as NSString
+        let fullRange = NSRange(location: 0, length: nsSource.length)
+        let matches = taskListMarkerRegex.matches(in: source, options: [], range: fullRange)
+        guard index < matches.count else { return source }
+
+        let target = matches[index]
+        guard target.numberOfRanges > 2 else { return source }
+        let stateRange = target.range(at: 2)
+        guard stateRange.location != NSNotFound, stateRange.length > 0 else { return source }
+
+        let replacement = checked ? "x" : " "
+        let existing = nsSource.substring(with: stateRange)
+        if existing == replacement {
+            return source
+        }
+
+        let mutable = NSMutableString(string: source)
+        mutable.replaceCharacters(in: stateRange, with: replacement)
+        return mutable as String
+    }
+
     private func activeWriterTextView() -> WriterTextView? {
         if let firstResponder = configuredWindow?.firstResponder as? WriterTextView {
             return firstResponder
@@ -503,12 +675,7 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
 
     private func openableContentTypes() -> [UTType] {
         var types: [UTType] = [.plainText, .text]
-        let extensions = [
-            "md", "markdown", "txt", "text", "rtf",
-            "html", "htm", "xml", "json", "csv", "tsv",
-            "log", "yaml", "yml"
-        ]
-        for fileExtension in extensions {
+        for fileExtension in Self.supportedOpenFileExtensions {
             if let type = UTType(filenameExtension: fileExtension) {
                 types.append(type)
             }
@@ -523,6 +690,52 @@ final class AppState: NSObject, ObservableObject, NSWindowDelegate {
         }
         types.append(.plainText)
         return types
+    }
+
+    private static func normalizedNSColor(from color: NSColor) -> NSColor {
+        if let extended = color.usingColorSpace(.extendedSRGB) {
+            return NSColor(
+                calibratedRed: extended.redComponent,
+                green: extended.greenComponent,
+                blue: extended.blueComponent,
+                alpha: extended.alphaComponent
+            )
+        }
+
+        if let rgb = color.usingColorSpace(.deviceRGB) {
+            return rgb
+        }
+        if let srgb = color.usingColorSpace(.sRGB),
+           let rgb = srgb.usingColorSpace(.deviceRGB) {
+            return rgb
+        }
+        if let converted = NSColor(cgColor: color.cgColor)?.usingColorSpace(.deviceRGB) {
+            return converted
+        }
+        return defaultEditorCursorNSColor
+    }
+
+    private static func nsColor(from hex: String) -> NSColor {
+        let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard cleaned.count == 6, let value = Int(cleaned, radix: 16) else {
+            return defaultEditorCursorNSColor
+        }
+
+        let red = CGFloat((value >> 16) & 0xFF) / 255.0
+        let green = CGFloat((value >> 8) & 0xFF) / 255.0
+        let blue = CGFloat(value & 0xFF) / 255.0
+        return NSColor(calibratedRed: red, green: green, blue: blue, alpha: 1.0)
+    }
+
+    private static func cssHexString(from color: NSColor) -> String {
+        let nsColor = normalizedNSColor(from: color)
+
+        let red = Int((max(0, min(1, nsColor.redComponent)) * 255).rounded())
+        let green = Int((max(0, min(1, nsColor.greenComponent)) * 255).rounded())
+        let blue = Int((max(0, min(1, nsColor.blueComponent)) * 255).rounded())
+
+        return String(format: "#%02X%02X%02X", red, green, blue)
     }
 }
 

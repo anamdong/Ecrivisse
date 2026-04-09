@@ -15,12 +15,12 @@ struct ExternalWindowRequest: Codable, Hashable {
 @main
 struct EcrivisseApp: App {
     @NSApplicationDelegateAdaptor(EcrivisseAppDelegate.self) private var appDelegate
-    private let minimumContentWidth: CGFloat = 620
-    private let minimumContentHeight: CGFloat = 420
+    private let minimumContentWidth: CGFloat = 820
+    private let minimumContentHeight: CGFloat = 500
 
     var body: some Scene {
         WindowGroup(for: ExternalWindowRequest.self) { externalFileRequest in
-            ContentView(initialExternalFilePath: externalFileRequest.wrappedValue?.path)
+            ContentView(initialExternalFileRequest: externalFileRequest.wrappedValue)
                 .frame(minWidth: minimumContentWidth, minHeight: minimumContentHeight)
         }
         .defaultSize(width: 980, height: 700)
@@ -36,6 +36,7 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
     private static let openDocumentsEventID = AEEventID(kAEOpenDocuments)
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = true
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleOpenDocumentsEvent(_:withReplyEvent:)),
@@ -108,18 +109,13 @@ final class EcrivisseAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
 
-        if let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isExcludedFromWindowsMenu }) ?? NSApp.windows.first {
+        if let window =
+            NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain && !$0.isExcludedFromWindowsMenu }) ??
+            NSApp.windows.first(where: { $0.isVisible }) {
             if window.isMiniaturized {
                 window.deminiaturize(nil)
             }
             window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
-            for sibling in NSApp.windows where sibling !== window {
-                if sibling.isMiniaturized {
-                    sibling.deminiaturize(nil)
-                }
-                sibling.orderFront(nil)
-            }
             return
         }
 
@@ -155,6 +151,14 @@ private struct WriterCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
+            Button("New Tab") {
+                appState?.requestNewTab()
+            }
+            .keyboardShortcut("t", modifiers: .command)
+            .disabled(appState == nil)
+
+            Divider()
+
             Button("New Empty Document") {
                 appState?.newDocument()
             }

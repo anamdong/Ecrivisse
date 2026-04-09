@@ -3,13 +3,18 @@ import WebKit
 import AppKit
 
 private let previewHoverMessageHandlerName = "ecrivissePreviewHover"
+private let previewTaskToggleMessageHandlerName = "ecrivissePreviewTaskToggle"
+private let previewNavigateMessageHandlerName = "ecrivissePreviewNavigate"
 
 struct MarkdownWebPreviewView: NSViewRepresentable {
     let markdown: String
     let previewFont: PreviewFontOption
+    let cursorColorHex: String
     let editorFollowRatio: Double
     let editorFollowEventID: Int
     var onHorizontalSwipe: (CGFloat) -> Void
+    var onTaskToggle: (_ index: Int, _ checked: Bool) -> Void
+    var onNavigateToSourceLine: (_ line: Int) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -27,10 +32,14 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         )
         let weakHandler = WeakScriptMessageHandler(delegate: context.coordinator)
         userContentController.add(weakHandler, name: previewHoverMessageHandlerName)
+        userContentController.add(weakHandler, name: previewTaskToggleMessageHandlerName)
+        userContentController.add(weakHandler, name: previewNavigateMessageHandlerName)
         config.userContentController = userContentController
 
         let webView = SwipeAwareWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        context.coordinator.onTaskToggle = onTaskToggle
+        context.coordinator.onNavigateToSourceLine = onNavigateToSourceLine
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
@@ -42,10 +51,18 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         DispatchQueue.main.async {
             configureOverlayScrollbars(for: webView)
         }
-        webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
+        webView.loadHTMLString(
+            MarkdownWebRenderer.htmlDocument(
+                from: markdown,
+                previewFont: previewFont,
+                cursorColorHex: cursorColorHex
+            ),
+            baseURL: nil
+        )
         context.coordinator.markInitiallyRendered(
             markdown: markdown,
             previewFont: previewFont,
+            cursorColorHex: cursorColorHex,
             editorFollowRatio: editorFollowRatio,
             editorFollowEventID: editorFollowEventID
         )
@@ -55,6 +72,8 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
     func updateNSView(_ nsView: SwipeAwareWebView, context: Context) {
         nsView.navigationDelegate = context.coordinator
         nsView.onHorizontalSwipe = onHorizontalSwipe
+        context.coordinator.onTaskToggle = onTaskToggle
+        context.coordinator.onNavigateToSourceLine = onNavigateToSourceLine
         nsView.shouldHandleHorizontalSwipe = { [weak coordinator = context.coordinator] in
             !(coordinator?.isHoveringScrollableCodeBlock ?? false)
         }
@@ -62,6 +81,7 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         context.coordinator.render(
             markdown: markdown,
             previewFont: previewFont,
+            cursorColorHex: cursorColorHex,
             editorFollowRatio: editorFollowRatio,
             editorFollowEventID: editorFollowEventID,
             in: nsView
@@ -94,34 +114,48 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         private var lastMarkdown: String = ""
         private var lastPreviewFont: PreviewFontOption = .systemSans
+        private var lastCursorColorHex: String = "#FF4D40"
         private var pendingEditorFollow: (eventID: Int, ratio: Double)?
         private var lastAppliedEditorFollowEventID: Int = -1
         var isHoveringScrollableCodeBlock: Bool = false
+        var onTaskToggle: ((Int, Bool) -> Void)?
+        var onNavigateToSourceLine: ((Int) -> Void)?
 
         func markInitiallyRendered(
             markdown: String,
             previewFont: PreviewFontOption,
+            cursorColorHex: String,
             editorFollowRatio: Double,
             editorFollowEventID: Int
         ) {
             lastMarkdown = markdown
             lastPreviewFont = previewFont
+            lastCursorColorHex = cursorColorHex
             queueEditorFollow(ratio: editorFollowRatio, eventID: editorFollowEventID)
         }
 
         func render(
             markdown: String,
             previewFont: PreviewFontOption,
+            cursorColorHex: String,
             editorFollowRatio: Double,
             editorFollowEventID: Int,
             in webView: WKWebView
         ) {
             queueEditorFollow(ratio: editorFollowRatio, eventID: editorFollowEventID)
 
-            if previewFont != lastPreviewFont {
+            if previewFont != lastPreviewFont || cursorColorHex != lastCursorColorHex {
                 lastPreviewFont = previewFont
+                lastCursorColorHex = cursorColorHex
                 lastMarkdown = markdown
-                webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
+                webView.loadHTMLString(
+                    MarkdownWebRenderer.htmlDocument(
+                        from: markdown,
+                        previewFont: previewFont,
+                        cursorColorHex: cursorColorHex
+                    ),
+                    baseURL: nil
+                )
                 return
             }
 
@@ -135,14 +169,21 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
             let pendingFollowEventID = pendingEditorFollow?.eventID
             let ratioLiteral = pendingEditorFollow.map { Self.javaScriptNumberLiteral($0.ratio) } ?? "null"
             let shouldFollowLiteral = pendingFollowEventID == nil ? "false" : "true"
-            let script = "window.ecrivisseUpdateBody(\(encodedBodyHTML), \(ratioLiteral), \(shouldFollowLiteral));"
+            let script = """
+            (() => {
+              if (typeof window.ecrivisseUpdateBody !== "function") { return "missing-update-body"; }
+              try {
+                window.ecrivisseUpdateBody(\(encodedBodyHTML), \(ratioLiteral), \(shouldFollowLiteral));
+                return "ok";
+              } catch (error) {
+                return "error:" + String(error);
+              }
+            })();
+            """
 
             webView.evaluateJavaScript(script) { [weak self, weak webView] _, error in
-                guard let self, let webView else { return }
-                if error != nil {
-                    webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown, previewFont: previewFont), baseURL: nil)
-                    return
-                }
+                guard let self, webView != nil else { return }
+                guard error == nil else { return }
                 if let pendingFollowEventID {
                     self.consumeEditorFollow(eventID: pendingFollowEventID)
                 }
@@ -150,16 +191,45 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.name == previewHoverMessageHandlerName else { return }
-            if let value = message.body as? Bool {
-                isHoveringScrollableCodeBlock = value
+            if message.name == previewHoverMessageHandlerName {
+                if let value = message.body as? Bool {
+                    isHoveringScrollableCodeBlock = value
+                    return
+                }
+                if let value = message.body as? NSNumber {
+                    isHoveringScrollableCodeBlock = value.boolValue
+                    return
+                }
+                isHoveringScrollableCodeBlock = false
                 return
             }
-            if let value = message.body as? NSNumber {
-                isHoveringScrollableCodeBlock = value.boolValue
+
+            if message.name == previewNavigateMessageHandlerName {
+                if let payload = message.body as? [String: Any],
+                   let lineValue = payload["line"] as? NSNumber {
+                    onNavigateToSourceLine?(lineValue.intValue)
+                    return
+                }
+                if let payload = message.body as? NSDictionary,
+                   let lineValue = payload["line"] as? NSNumber {
+                    onNavigateToSourceLine?(lineValue.intValue)
+                }
                 return
             }
-            isHoveringScrollableCodeBlock = false
+
+            guard message.name == previewTaskToggleMessageHandlerName else { return }
+
+            if let payload = message.body as? [String: Any],
+               let indexValue = payload["index"] as? NSNumber,
+               let checkedValue = payload["checked"] as? NSNumber {
+                onTaskToggle?(indexValue.intValue, checkedValue.boolValue)
+                return
+            }
+            if let payload = message.body as? NSDictionary,
+               let indexValue = payload["index"] as? NSNumber,
+               let checkedValue = payload["checked"] as? NSNumber {
+                onTaskToggle?(indexValue.intValue, checkedValue.boolValue)
+            }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -273,7 +343,8 @@ enum MarkdownWebRenderer {
     static let previewInteractionScript = """
     (() => {
       const handler = window.webkit?.messageHandlers?.\(previewHoverMessageHandlerName);
-      if (!handler) { return; }
+      const taskHandler = window.webkit?.messageHandlers?.\(previewTaskToggleMessageHandlerName);
+      const navigateHandler = window.webkit?.messageHandlers?.\(previewNavigateMessageHandlerName);
 
       const isInHorizontallyScrollableCode = (element) => {
         const pre = element?.closest?.("pre");
@@ -281,7 +352,7 @@ enum MarkdownWebRenderer {
         return (pre.scrollWidth - pre.clientWidth) > 1;
       };
 
-      let lastValue = null;
+      var lastValue = null;
       const publish = (value) => {
         if (lastValue === value) { return; }
         lastValue = value;
@@ -292,10 +363,42 @@ enum MarkdownWebRenderer {
         publish(isInHorizontallyScrollableCode(event.target));
       };
 
-      document.addEventListener("mouseover", updateFromEvent, { passive: true });
-      document.addEventListener("mousemove", updateFromEvent, { passive: true });
-      document.addEventListener("mouseleave", () => publish(false), { passive: true });
-      publish(false);
+      if (handler) {
+        document.addEventListener("mouseover", updateFromEvent, { passive: true });
+        document.addEventListener("mousemove", updateFromEvent, { passive: true });
+        document.addEventListener("mouseleave", () => publish(false), { passive: true });
+        publish(false);
+      }
+
+      if (taskHandler) {
+        document.addEventListener("change", (event) => {
+          const target = event.target;
+          if (!(target instanceof HTMLInputElement)) { return; }
+          if (target.type !== "checkbox") { return; }
+          if (!target.closest("ul.task-list")) { return; }
+          const rawIndex = target.getAttribute("data-cw-task-index");
+          if (rawIndex == null) { return; }
+          const index = Number(rawIndex);
+          if (!Number.isFinite(index)) { return; }
+          taskHandler.postMessage({ index, checked: !!target.checked });
+        }, { passive: true });
+      }
+
+      if (navigateHandler) {
+        document.addEventListener("click", (event) => {
+          const target = event.target;
+          if (!(target instanceof Element)) { return; }
+          if (target.closest("a")) { return; }
+          if (target.closest("input[type='checkbox']")) { return; }
+          const sourceNode = target.closest("[data-cw-line]");
+          if (!sourceNode) { return; }
+          const rawLine = sourceNode.getAttribute("data-cw-line");
+          if (rawLine == null) { return; }
+          const line = Number(rawLine);
+          if (!Number.isFinite(line)) { return; }
+          navigateHandler.postMessage({ line });
+        }, { passive: true });
+      }
     })();
     """
 
@@ -346,7 +449,73 @@ enum MarkdownWebRenderer {
         var title: String?
     }
 
-    static func htmlDocument(from markdown: String, previewFont: PreviewFontOption = .systemSans) -> String {
+    private static let taxTermsRegex: NSRegularExpression = {
+        let terms = [
+            "tax", "taxes", "taxation",
+            "impuesto", "impuestos", "tributo", "tributos",
+            "impot", "impôt", "impôts", "taxe", "taxes",
+            "steuer", "steuern", "abgabe",
+            "tassa", "tasse", "imposta", "imposte",
+            "imposto", "impostos", "taxa", "taxas",
+            "belasting", "belastingen",
+            "налог", "налоги", "налогообложение",
+            "податок", "податки",
+            "podatek", "podatki",
+            "daň", "daně", "dane",
+            "adó", "adók",
+            "vergi", "vergiler", "vergisi",
+            "φόρος", "φόροι",
+            "impozit", "impozite",
+            "данък", "данъци",
+            "porez", "porezi",
+            "davek", "davki",
+            "mokestis", "mokesčiai",
+            "nodoklis", "nodokļi",
+            "maks", "maksud",
+            "skatt", "skatter", "skat", "skattur", "skattar",
+            "vero", "verot",
+            "세금", "조세",
+            "税", "税金", "租税", "税收",
+            "稅", "稅金", "稅收",
+            "ภาษี",
+            "कर", "करों",
+            "কর",
+            "வரி",
+            "పన్ను",
+            "ತೆರಿಗೆ",
+            "നികുതി",
+            "ਟੈਕਸ", "ਕਰ",
+            "thuế",
+            "pajak",
+            "cukai",
+            "buwis",
+            "ضريبة", "ضرائب",
+            "مالیات",
+            "ٹیکس",
+            "מס", "מיסים",
+            "kodi",
+            "intela",
+            "irhafu",
+            "owa-ori", "owo-ori",
+            "გადასახადი",
+            "հարկ"
+        ]
+        let escaped = terms.map { NSRegularExpression.escapedPattern(for: $0) }
+        let pattern = "(?<![\\p{L}\\p{N}_])(?:" + escaped.joined(separator: "|") + ")(?![\\p{L}\\p{N}_])"
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+
+    private struct TOCHeadingEntry {
+        var level: Int
+        var anchorID: String
+        var titleHTML: String
+    }
+
+    static func htmlDocument(
+        from markdown: String,
+        previewFont: PreviewFontOption = .systemSans,
+        cursorColorHex: String = "#FF4D40"
+    ) -> String {
         let bodyHTML = makeHTMLBody(from: markdown)
         let previewFontStack = previewFont.cssFontStack
         return """
@@ -363,7 +532,15 @@ enum MarkdownWebRenderer {
               --muted: #5c5f66;
               --rule: #d9dade;
               --code-bg: #f5f6f8;
+              --code-fg: #20242b;
               --link: #3b6ea9;
+              --code-keyword: #9652d6;
+              --code-string: #13885f;
+              --code-number: #0f6cc0;
+              --code-comment: #7b8088;
+              --code-title: #9256d0;
+              --code-attr: #9b3f77;
+              --cursor-accent: \(cursorColorHex);
             }
             @media (prefers-color-scheme: dark) {
               :root {
@@ -372,7 +549,14 @@ enum MarkdownWebRenderer {
                 --muted: #a0a4ad;
                 --rule: #2b2f36;
                 --code-bg: #1a1d22;
+                --code-fg: #e8edf3;
                 --link: #8eb7eb;
+                --code-keyword: #c996ff;
+                --code-string: #7dd7ac;
+                --code-number: #7bc3ff;
+                --code-comment: #8f95a0;
+                --code-title: #d2a5ff;
+                --code-attr: #f3a4cf;
               }
             }
             html, body {
@@ -407,7 +591,7 @@ enum MarkdownWebRenderer {
               margin: 0.28em 0;
             }
             ul.task-list input[type="checkbox"] {
-              margin-top: 0.18em;
+              margin-top: 0.28em;
               accent-color: #3b6ea9;
             }
             ul.task-list .task-text {
@@ -426,6 +610,43 @@ enum MarkdownWebRenderer {
               margin-bottom: 0.45em;
               letter-spacing: 0;
               overflow: visible;
+            }
+            .cw-toc {
+              border: 1px solid var(--rule);
+              border-radius: 10px;
+              padding: 0.8em 0.95em;
+              margin: 0.95em 0 1.1em;
+              background: color-mix(in oklab, var(--code-bg) 38%, var(--bg));
+            }
+            .cw-toc-title {
+              font-size: 0.93em;
+              font-weight: 700;
+              color: var(--muted);
+              margin-bottom: 0.52em;
+              letter-spacing: 0.02em;
+              text-transform: uppercase;
+            }
+            .cw-toc-list {
+              list-style: none;
+              padding-left: 0;
+              margin: 0;
+            }
+            .cw-toc-item {
+              margin: 0.2em 0;
+            }
+            .cw-toc-level-1 { padding-left: 0; }
+            .cw-toc-level-2 { padding-left: 0.95em; }
+            .cw-toc-level-3 { padding-left: 1.7em; }
+            .cw-toc-level-4 { padding-left: 2.45em; }
+            .cw-toc-level-5 { padding-left: 3.2em; }
+            .cw-toc-level-6 { padding-left: 3.95em; }
+            .cw-toc-empty {
+              color: var(--muted);
+              margin: 0;
+            }
+            .cw-tax-term {
+              color: var(--cursor-accent);
+              font-weight: 600;
             }
             p, ul, ol, blockquote, pre {
               margin: 0.85em 0;
@@ -458,6 +679,7 @@ enum MarkdownWebRenderer {
               background: var(--code-bg);
               border-radius: 6px;
               padding: 0.08em 0.35em;
+              color: var(--code-fg);
             }
             pre {
               background: var(--code-bg);
@@ -468,6 +690,48 @@ enum MarkdownWebRenderer {
             pre code {
               background: transparent;
               padding: 0;
+            }
+            .hljs, .cw-hljs-fallback {
+              color: var(--code-fg);
+              background: transparent;
+            }
+            code.inline-hljs, code.inline-cw-hljs {
+              display: inline;
+            }
+            .hljs-keyword, .hljs-built_in, .hljs-literal, .hljs-selector-tag {
+              color: var(--code-keyword);
+            }
+            .hljs-title, .hljs-title.class_, .hljs-title.function_ {
+              color: var(--code-title);
+            }
+            .hljs-string, .hljs-regexp, .hljs-template-tag, .hljs-template-variable {
+              color: var(--code-string);
+            }
+            .hljs-number, .hljs-symbol, .hljs-bullet {
+              color: var(--code-number);
+            }
+            .hljs-comment, .hljs-quote {
+              color: var(--code-comment);
+            }
+            .hljs-attr, .hljs-attribute, .hljs-property {
+              color: var(--code-attr);
+            }
+            .cw-token-keyword {
+              color: var(--code-keyword);
+              font-weight: 600;
+            }
+            .cw-token-type {
+              color: var(--code-title);
+            }
+            .cw-token-string {
+              color: var(--code-string);
+            }
+            .cw-token-number {
+              color: var(--code-number);
+            }
+            .cw-token-comment {
+              color: var(--code-comment);
+              font-style: italic;
             }
             table {
               width: 100%;
@@ -482,6 +746,17 @@ enum MarkdownWebRenderer {
             .math-block {
               margin: 1.05em 0;
               overflow-x: auto;
+            }
+            .latex-cmd-output {
+              margin: 1em 0;
+              border: 1px solid var(--rule);
+              background: var(--code-bg);
+              border-radius: 10px;
+              padding: 0.75em 0.9em;
+            }
+            .latex-cmd-output p {
+              margin: 0;
+              white-space: pre-wrap;
             }
             .math-block mjx-container[display="true"] {
               margin: 0.2em 0 !important;
@@ -526,6 +801,11 @@ enum MarkdownWebRenderer {
             }
           </style>
           <script>
+            window.ecrivisseApplySyntaxHighlighting = (root) => {
+              // Syntax highlighting is pre-rendered from Swift.
+              return;
+            };
+
             window.ecrivisseScrollToRatio = (ratio) => {
               const safeRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
               let calibratedRatio = safeRatio;
@@ -610,15 +890,27 @@ enum MarkdownWebRenderer {
                 window.scrollTo(0, Math.min(maxOffset, previousOffset));
               };
 
+              const finalize = () => {
+                window.ecrivisseApplySyntaxHighlighting(main);
+                restoreScroll();
+              };
+
               if (window.MathJax?.typesetPromise) {
                 try {
                   window.MathJax.typesetClear?.([main]);
                 } catch (_) {}
-                window.MathJax.typesetPromise([main]).then(restoreScroll).catch(restoreScroll);
-              } else {
-                restoreScroll();
+                window.MathJax.typesetPromise([main]).then(finalize).catch(finalize);
+                return;
               }
+
+              finalize();
             };
+
+            window.addEventListener("load", () => {
+              const main = document.querySelector("main.wrap");
+              if (!main) { return; }
+              window.ecrivisseApplySyntaxHighlighting(main);
+            });
           </script>
           <script>
             window.MathJax = {
@@ -656,14 +948,20 @@ enum MarkdownWebRenderer {
         let rawLines = normalized.components(separatedBy: "\n")
         let extraction = extractDefinitions(from: rawLines)
         let lines = extraction.contentLines
+        let contentLineIndices = extraction.contentLineIndices
         let linkDefinitions = extraction.linkDefinitions
         let footnoteDefinitions = extraction.footnoteDefinitions
 
         var htmlParts: [String] = []
         var paragraphBuffer: [String] = []
+        var paragraphStartSourceLine: Int?
         var listStack: [ListContext] = []
         var footnoteOrder: [String] = []
         var footnoteIndexByID: [String: Int] = [:]
+        var tocHeadings: [TOCHeadingEntry] = []
+        var tocAnchorCounts: [String: Int] = [:]
+        var tocPlaceholderTokens: [String] = []
+        var taskItemIndex = 0
         var index = 0
 
         func parseInlineContent(_ text: String, trackFootnotes: Bool = true) -> String {
@@ -711,11 +1009,13 @@ enum MarkdownWebRenderer {
         func flushParagraphIfNeeded() {
             guard !paragraphBuffer.isEmpty else { return }
             let inline = paragraphBuffer.map { parseInlineContent($0) }.joined(separator: "<br/>")
-            htmlParts.append("<p>\(inline)</p>")
+            let lineAttribute = paragraphStartSourceLine.map { " data-cw-line=\"\($0)\"" } ?? ""
+            htmlParts.append("<p\(lineAttribute)>\(inline)</p>")
             paragraphBuffer.removeAll(keepingCapacity: true)
+            paragraphStartSourceLine = nil
         }
 
-        func appendListItem(type: ListType, indent: Int, text: String) {
+        func appendListItem(type: ListType, indent: Int, text: String, sourceLine: Int) {
             while let top = listStack.last, indent < top.indent {
                 closeTopList()
             }
@@ -750,24 +1050,36 @@ enum MarkdownWebRenderer {
                 openList(type, indent: indent)
             }
 
-            htmlParts.append("<li>\(parseInlineContent(text))")
+            htmlParts.append("<li data-cw-line=\"\(sourceLine)\">\(parseInlineContent(text))")
             listStack[listStack.count - 1].hasOpenListItem = true
         }
 
-        func renderTaskListItemHTML(_ item: TaskListItem) -> String {
+        func renderTaskListItemHTML(_ item: TaskListItem, index: Int, sourceLine: Int) -> String {
             let checkedAttribute = item.checked ? " checked" : ""
-            return "<li><input type=\"checkbox\" disabled\(checkedAttribute) /><span class=\"task-text\">\(parseInlineContent(item.content))</span></li>"
+            return "<li data-cw-line=\"\(sourceLine)\"><input type=\"checkbox\" data-cw-task-index=\"\(index)\"\(checkedAttribute) /><span class=\"task-text\">\(parseInlineContent(item.content))</span></li>"
         }
 
         while index < lines.count {
             let line = lines[index]
+            let sourceLine = index < contentLineIndices.count ? contentLineIndices[index] : index
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
-            if let fence = captureGroups(in: line, pattern: #"^\s*```([A-Za-z0-9_-]+)?\s*$"#) {
+            if line.range(of: #"^\s*\{\{\s*toc\s*\}\}\s*$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                flushParagraphIfNeeded()
+                closeAllLists()
+                let token = "@@CWTOC\(tocPlaceholderTokens.count)@@"
+                tocPlaceholderTokens.append(token)
+                htmlParts.append("<div class=\"cw-toc-slot\" data-cw-line=\"\(sourceLine)\">\(token)</div>")
+                index += 1
+                continue
+            }
+
+            if let fence = captureGroups(in: line, pattern: #"^\s*```([A-Za-z0-9_-]+)?(?:\s+\{([^}]*)\})?\s*$"#) {
                 flushParagraphIfNeeded()
                 closeAllLists()
 
                 let language = (fence.count > 1 ? fence[1] : "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let fenceOptions = (fence.count > 2 ? fence[2] : "").trimmingCharacters(in: .whitespacesAndNewlines)
                 var codeLines: [String] = []
                 index += 1
                 while index < lines.count {
@@ -778,9 +1090,18 @@ enum MarkdownWebRenderer {
                     codeLines.append(current)
                     index += 1
                 }
-                let code = escapeHTML(codeLines.joined(separator: "\n"))
-                let classAttribute = language.isEmpty ? "" : " class=\"language-\(escapeHTML(language))\""
-                htmlParts.append("<pre><code\(classAttribute)>\(code)</code></pre>")
+                let rawCode = codeLines.joined(separator: "\n")
+                if language.lowercased() == "latex",
+                   shouldRenderLaTeXCommandBlock(fenceOptions: fenceOptions),
+                   let renderedLaTeX = renderLaTeXCommandBlockHTML(from: rawCode) {
+                    htmlParts.append("<div class=\"latex-cmd-output\" data-cw-line=\"\(sourceLine)\"><p>\(renderedLaTeX)</p></div>")
+                } else {
+                    let highlightedCode = fallbackSyntaxHighlightedCodeHTML(rawCode)
+                    let classAttribute = language.isEmpty
+                        ? " class=\"cw-hljs-fallback\""
+                        : " class=\"language-\(escapeHTML(language)) cw-hljs-fallback\""
+                    htmlParts.append("<pre data-cw-line=\"\(sourceLine)\"><code data-cw-prehighlighted=\"1\"\(classAttribute)>\(highlightedCode)</code></pre>")
+                }
                 if index < lines.count {
                     index += 1
                 }
@@ -790,7 +1111,7 @@ enum MarkdownWebRenderer {
             if let singleLineMath = parseSingleLineDisplayMath(line) {
                 flushParagraphIfNeeded()
                 closeAllLists()
-                htmlParts.append("<div class=\"math-block\">\\[\(escapeHTML(singleLineMath))\\]</div>")
+                htmlParts.append("<div class=\"math-block\" data-cw-line=\"\(sourceLine)\">\\[\(escapeHTML(singleLineMath))\\]</div>")
                 index += 1
                 continue
             }
@@ -812,7 +1133,7 @@ enum MarkdownWebRenderer {
                 }
 
                 let expression = mathLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                htmlParts.append("<div class=\"math-block\">\\[\(escapeHTML(expression))\\]</div>")
+                htmlParts.append("<div class=\"math-block\" data-cw-line=\"\(sourceLine)\">\\[\(escapeHTML(expression))\\]</div>")
                 continue
             }
 
@@ -826,7 +1147,7 @@ enum MarkdownWebRenderer {
             if line.range(of: #"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$"#, options: .regularExpression) != nil {
                 flushParagraphIfNeeded()
                 closeAllLists()
-                htmlParts.append("<hr/>")
+                htmlParts.append("<hr data-cw-line=\"\(sourceLine)\"/>")
                 index += 1
                 continue
             }
@@ -856,7 +1177,7 @@ enum MarkdownWebRenderer {
                 flushParagraphIfNeeded()
                 closeAllLists()
 
-                htmlParts.append("<dl>")
+                htmlParts.append("<dl data-cw-line=\"\(sourceLine)\">")
                 var rowIndex = index
                 while rowIndex < lines.count {
                     let termLine = lines[rowIndex]
@@ -888,7 +1209,7 @@ enum MarkdownWebRenderer {
                 flushParagraphIfNeeded()
                 closeAllLists()
 
-                htmlParts.append("<table><thead><tr>")
+                htmlParts.append("<table data-cw-line=\"\(sourceLine)\"><thead><tr>")
                 for (columnIndex, rawCell) in headerCells.enumerated() {
                     let alignmentAttribute = tableAlignmentAttribute(alignments[columnIndex])
                     htmlParts.append("<th\(alignmentAttribute)>\(parseInlineContent(rawCell))</th>")
@@ -932,7 +1253,10 @@ enum MarkdownWebRenderer {
                 closeAllLists()
                 let level = heading[1].count
                 let content = parseInlineContent(heading[2])
-                htmlParts.append("<h\(level)>\(content)</h\(level)>")
+                let anchorBase = safeAnchorID(for: plainText(fromHTML: content))
+                let anchorID = uniqueAnchorID(base: anchorBase, counts: &tocAnchorCounts)
+                tocHeadings.append(TOCHeadingEntry(level: level, anchorID: anchorID, titleHTML: content))
+                htmlParts.append("<h\(level) id=\"\(anchorID)\" data-cw-line=\"\(sourceLine)\">\(content)</h\(level)>")
                 index += 1
                 continue
             }
@@ -953,7 +1277,7 @@ enum MarkdownWebRenderer {
                     index += 1
                 }
 
-                htmlParts.append("<blockquote><p>\(quoteLines.joined(separator: "<br/>"))</p></blockquote>")
+                htmlParts.append("<blockquote data-cw-line=\"\(sourceLine)\"><p>\(quoteLines.joined(separator: "<br/>"))</p></blockquote>")
                 continue
             }
 
@@ -968,9 +1292,12 @@ enum MarkdownWebRenderer {
                     rowIndex += 1
                 }
 
-                htmlParts.append("<ul class=\"task-list\">")
-                for item in items {
-                    htmlParts.append(renderTaskListItemHTML(item))
+                htmlParts.append("<ul class=\"task-list\" data-cw-line=\"\(sourceLine)\">")
+                for (itemOffset, item) in items.enumerated() {
+                    let itemSourceIndex = index + itemOffset
+                    let itemSourceLine = itemSourceIndex < contentLineIndices.count ? contentLineIndices[itemSourceIndex] : sourceLine
+                    htmlParts.append(renderTaskListItemHTML(item, index: taskItemIndex, sourceLine: itemSourceLine))
+                    taskItemIndex += 1
                 }
                 htmlParts.append("</ul>")
 
@@ -981,7 +1308,7 @@ enum MarkdownWebRenderer {
             if let unordered = captureGroups(in: line, pattern: #"^([ \t]*)([-+*])\s+(.+)$"#) {
                 flushParagraphIfNeeded()
                 let indent = indentationWidth(unordered[1])
-                appendListItem(type: .unordered, indent: indent, text: unordered[3])
+                appendListItem(type: .unordered, indent: indent, text: unordered[3], sourceLine: sourceLine)
                 index += 1
                 continue
             }
@@ -989,12 +1316,15 @@ enum MarkdownWebRenderer {
             if let ordered = captureGroups(in: line, pattern: #"^([ \t]*)(\d+)\.\s+(.+)$"#) {
                 flushParagraphIfNeeded()
                 let indent = indentationWidth(ordered[1])
-                appendListItem(type: .ordered, indent: indent, text: ordered[3])
+                appendListItem(type: .ordered, indent: indent, text: ordered[3], sourceLine: sourceLine)
                 index += 1
                 continue
             }
 
             closeAllLists()
+            if paragraphBuffer.isEmpty {
+                paragraphStartSourceLine = sourceLine
+            }
             paragraphBuffer.append(trimmed)
             index += 1
         }
@@ -1020,7 +1350,15 @@ enum MarkdownWebRenderer {
             htmlParts.append("</section>")
         }
 
-        return htmlParts.joined(separator: "\n")
+        var outputHTML = htmlParts.joined(separator: "\n")
+        if !tocPlaceholderTokens.isEmpty {
+            let tocHTML = makeTOCHTML(from: tocHeadings)
+            for token in tocPlaceholderTokens {
+                outputHTML = outputHTML.replacingOccurrences(of: token, with: tocHTML)
+            }
+        }
+
+        return outputHTML
     }
 
     private static func escapeHTML(_ value: String) -> String {
@@ -1028,6 +1366,91 @@ enum MarkdownWebRenderer {
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    private static func fallbackSyntaxHighlightedCodeHTML(_ source: String) -> String {
+        var working = source
+        var preservedSnippets: [String] = []
+
+        func preserve(_ html: String) -> String {
+            let token = "@@CWCODEHL\(preservedSnippets.count)@@"
+            preservedSnippets.append(html)
+            return token
+        }
+
+        working = replacingMatches(in: working, pattern: #"/\*[\s\S]*?\*/"#) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-comment\">\(escapeHTML(tokenText))</span>")
+        }
+        working = replacingMatches(in: working, pattern: #"//[^\n]*"#) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-comment\">\(escapeHTML(tokenText))</span>")
+        }
+        working = replacingMatches(in: working, pattern: #"#[^\n]*"#) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-comment\">\(escapeHTML(tokenText))</span>")
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#
+        ) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-string\">\(escapeHTML(tokenText))</span>")
+        }
+
+        working = replacingMatches(in: working, pattern: #"\b(?:0x[0-9A-Fa-f]+|\d+(?:\.\d+)?)\b"#) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-number\">\(escapeHTML(tokenText))</span>")
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"\b(?:and|as|assert|async|await|break|case|catch|class|const|continue|def|default|defer|do|else|enum|export|extends|false|final|finally|for|from|func|function|guard|if|import|in|interface|is|let|match|module|new|nil|null|or|package|pass|private|protected|protocol|public|raise|repeat|return|self|static|struct|super|switch|this|throw|throws|trait|true|try|type|typeof|var|void|when|where|while|with|yield)\b"#
+        ) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-keyword\">\(escapeHTML(tokenText))</span>")
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"\b(?:Any|Array|Bool|Dictionary|Double|Float|Int|Map|Optional|Promise|Result|Set|String|Void|None|True|False)\b"#
+        ) { match, ns in
+            let tokenText = ns.substring(with: match.range(at: 0))
+            return preserve("<span class=\"cw-token-type\">\(escapeHTML(tokenText))</span>")
+        }
+
+        working = escapeHTML(working)
+
+        for (index, snippet) in preservedSnippets.enumerated() {
+            working = working.replacingOccurrences(of: "@@CWCODEHL\(index)@@", with: snippet)
+        }
+        return working
+    }
+
+    private static func shouldRenderLaTeXCommandBlock(fenceOptions: String) -> Bool {
+        guard !fenceOptions.isEmpty else { return false }
+        let normalized = fenceOptions.lowercased()
+        return normalized.range(of: #"\bcmd\s*=\s*true\b"#, options: .regularExpression) != nil
+    }
+
+    private static func renderLaTeXCommandBlockHTML(from source: String) -> String? {
+        let normalized = source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        if let groups = captureGroups(
+            in: normalized,
+            pattern: #"\\begin\{document\}([\s\S]*?)\\end\{document\}"#
+        ), groups.count > 1 {
+            let inner = groups[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !inner.isEmpty else { return nil }
+            return escapeHTML(inner).replacingOccurrences(of: "\n", with: "<br/>")
+        }
+
+        let trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return escapeHTML(trimmed).replacingOccurrences(of: "\n", with: "<br/>")
     }
 
     private static func parseInline(
@@ -1060,7 +1483,8 @@ enum MarkdownWebRenderer {
         working = replacingMatches(in: working, pattern: #"`([^`]+)`"#) { match, ns in
             let codeText = ns.substring(with: match.range(at: 1))
             let token = "@@CWTOKENCODE\(codeSnippets.count)@@"
-            codeSnippets.append("<code>\(escapeHTML(codeText))</code>")
+            let highlightedCode = fallbackSyntaxHighlightedCodeHTML(codeText)
+            codeSnippets.append("<code data-cw-prehighlighted=\"1\" class=\"cw-hljs-fallback inline-cw-hljs\">\(highlightedCode)</code>")
             return token
         }
 
@@ -1333,29 +1757,18 @@ enum MarkdownWebRenderer {
         from lines: [String]
     ) -> (
         contentLines: [String],
+        contentLineIndices: [Int],
         linkDefinitions: [String: LinkReferenceDefinition],
         footnoteDefinitions: [String: String]
     ) {
         var contentLines: [String] = []
+        var contentLineIndices: [Int] = []
         var linkDefinitions: [String: LinkReferenceDefinition] = [:]
         var footnoteDefinitions: [String: String] = [:]
 
         var index = 0
         while index < lines.count {
             let line = lines[index]
-
-            if let linkGroups = captureGroups(
-                in: line,
-                pattern: #"^\s*\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?\s*$"#
-            ), linkGroups.count > 2 {
-                let key = normalizeReferenceKey(linkGroups[1])
-                let url = cleanURL(linkGroups[2])
-                let possibleTitles = Array(linkGroups.dropFirst(3))
-                let title = possibleTitles.first { !$0.isEmpty }?.trimmingCharacters(in: .whitespacesAndNewlines)
-                linkDefinitions[key] = LinkReferenceDefinition(url: url, title: title?.isEmpty == true ? nil : title)
-                index += 1
-                continue
-            }
 
             if let footnoteGroups = captureGroups(in: line, pattern: #"^\s*\[\^([^\]]+)\]:\s*(.+?)\s*$"#),
                footnoteGroups.count > 2 {
@@ -1377,11 +1790,25 @@ enum MarkdownWebRenderer {
                 continue
             }
 
+            if let linkGroups = captureGroups(
+                in: line,
+                pattern: #"^\s*\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?\s*$"#
+            ), linkGroups.count > 2 {
+                let key = normalizeReferenceKey(linkGroups[1])
+                let url = cleanURL(linkGroups[2])
+                let possibleTitles = Array(linkGroups.dropFirst(3))
+                let title = possibleTitles.first { !$0.isEmpty }?.trimmingCharacters(in: .whitespacesAndNewlines)
+                linkDefinitions[key] = LinkReferenceDefinition(url: url, title: title?.isEmpty == true ? nil : title)
+                index += 1
+                continue
+            }
+
             contentLines.append(line)
+            contentLineIndices.append(index)
             index += 1
         }
 
-        return (contentLines, linkDefinitions, footnoteDefinitions)
+        return (contentLines, contentLineIndices, linkDefinitions, footnoteDefinitions)
     }
 
     private static func normalizeReferenceKey(_ raw: String) -> String {
@@ -1398,6 +1825,115 @@ enum MarkdownWebRenderer {
         anchor = anchor.replacingOccurrences(of: #"-{2,}"#, with: "-", options: .regularExpression)
         anchor = anchor.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return anchor.isEmpty ? "note" : anchor
+    }
+
+    private static func highlightTaxTerms(in html: String) -> String {
+        guard !html.isEmpty else { return html }
+
+        let nonHighlightTagNames: Set<String> = ["code", "pre", "script", "style"]
+        var nonHighlightDepth = 0
+        var output = ""
+        var cursor = html.startIndex
+
+        while cursor < html.endIndex {
+            if html[cursor] == "<" {
+                guard let closingIndex = html[cursor...].firstIndex(of: ">") else {
+                    output += String(html[cursor...])
+                    break
+                }
+
+                let afterTag = html.index(after: closingIndex)
+                let tag = String(html[cursor..<afterTag])
+                output += tag
+
+                if let tagName = htmlTagName(in: tag)?.lowercased(),
+                   nonHighlightTagNames.contains(tagName) {
+                    let trimmedTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let isClosingTag = trimmedTag.hasPrefix("</")
+                    let isSelfClosingTag = trimmedTag.hasSuffix("/>")
+
+                    if isClosingTag {
+                        nonHighlightDepth = max(0, nonHighlightDepth - 1)
+                    } else if !isSelfClosingTag {
+                        nonHighlightDepth += 1
+                    }
+                }
+
+                cursor = afterTag
+                continue
+            }
+
+            let nextTagIndex = html[cursor...].firstIndex(of: "<") ?? html.endIndex
+            let segment = String(html[cursor..<nextTagIndex])
+            if nonHighlightDepth > 0 {
+                output += segment
+            } else {
+                output += highlightTaxTermsInPlainSegment(segment)
+            }
+            cursor = nextTagIndex
+        }
+
+        return output
+    }
+
+    private static func highlightTaxTermsInPlainSegment(_ segment: String) -> String {
+        guard !segment.isEmpty else { return segment }
+        let nsSegment = segment as NSString
+        let fullRange = NSRange(location: 0, length: nsSegment.length)
+        let matches = taxTermsRegex.matches(in: segment, options: [], range: fullRange)
+        guard !matches.isEmpty else { return segment }
+
+        let mutable = NSMutableString(string: segment)
+        for match in matches.reversed() {
+            let range = match.range(at: 0)
+            guard range.location != NSNotFound, range.length > 0 else { continue }
+            let matched = nsSegment.substring(with: range)
+            let replacement = "<span class=\"cw-tax-term\">\(matched)</span>"
+            mutable.replaceCharacters(in: range, with: replacement)
+        }
+        return mutable as String
+    }
+
+    private static func uniqueAnchorID(base: String, counts: inout [String: Int]) -> String {
+        let normalizedBase = base.isEmpty ? "section" : base
+        let current = counts[normalizedBase, default: 0]
+        counts[normalizedBase] = current + 1
+        if current == 0 {
+            return normalizedBase
+        }
+        return "\(normalizedBase)-\(current + 1)"
+    }
+
+    private static func plainText(fromHTML html: String) -> String {
+        var text = html.replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+        text = text
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+        text = text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func makeTOCHTML(from headings: [TOCHeadingEntry]) -> String {
+        let filteredHeadings = headings.filter { !$0.titleHTML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !filteredHeadings.isEmpty else {
+            return "<nav class=\"cw-toc\" aria-label=\"Table of contents\"><div class=\"cw-toc-title\">Table of Contents</div><p class=\"cw-toc-empty\">No headings found.</p></nav>"
+        }
+
+        var html: [String] = []
+        html.append("<nav class=\"cw-toc\" aria-label=\"Table of contents\">")
+        html.append("<div class=\"cw-toc-title\">Table of Contents</div>")
+        html.append("<ol class=\"cw-toc-list\">")
+        for heading in filteredHeadings {
+            let level = min(max(heading.level, 1), 6)
+            html.append("<li class=\"cw-toc-item cw-toc-level-\(level)\"><a href=\"#\(heading.anchorID)\">\(heading.titleHTML)</a></li>")
+        }
+        html.append("</ol>")
+        html.append("</nav>")
+        return html.joined()
     }
 
     private static func parseDefinitionListLine(_ line: String) -> String? {

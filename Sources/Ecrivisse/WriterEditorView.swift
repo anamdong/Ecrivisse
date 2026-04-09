@@ -5,6 +5,7 @@ struct WriterEditorView: NSViewRepresentable {
     @Binding var text: String
     var fontSize: CGFloat
     var focusMode: FocusMode
+    var cursorColor: NSColor
     var summarizeDocumentRequestID: Int
     var onHorizontalSwipe: (CGFloat) -> Void
     var onAIError: (String) -> Void
@@ -49,6 +50,7 @@ struct WriterEditorView: NSViewRepresentable {
         }
         textView.string = text
         textView.focusMode = focusMode
+        textView.customCursorColor = cursorColor
         textView.scheduleStyling(reason: .fullRefresh)
 
         scrollView.documentView = textView
@@ -67,6 +69,7 @@ struct WriterEditorView: NSViewRepresentable {
         guard let textView = context.coordinator.textView else { return }
         textView.editorFontSize = fontSize
         textView.focusMode = focusMode
+        textView.customCursorColor = cursorColor
         textView.onAIError = { [weak coordinator = context.coordinator] message in
             coordinator?.handleAIError(message)
         }
@@ -137,6 +140,9 @@ struct WriterEditorView: NSViewRepresentable {
             parent.text = value
             parent.onUserEdit(value)
             textView.scheduleStyling(reason: .textChanged)
+            if textView.window?.firstResponder === textView {
+                emitEditingLocation()
+            }
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -162,6 +168,9 @@ struct WriterEditorView: NSViewRepresentable {
             parent.text = value
             parent.onUserEdit(value)
             textView.scheduleStyling(reason: .textChanged)
+            if textView.window?.firstResponder === textView {
+                emitEditingLocation()
+            }
         }
 
         func emitEditingLocation() {
@@ -173,6 +182,12 @@ struct WriterEditorView: NSViewRepresentable {
 }
 
 final class WriterTextView: NSTextView {
+    private struct ListContinuation {
+        let insertionPrefix: String
+        let markerLength: Int
+        let isContentEmpty: Bool
+    }
+
     enum StylingReason {
         case textChanged
         case selectionChanged
@@ -217,15 +232,114 @@ final class WriterTextView: NSTextView {
     var onCompositionCommit: (() -> Void)?
     var onHorizontalSwipe: ((CGFloat) -> Void)?
     var onAIError: ((String) -> Void)?
+    var customCursorColor: NSColor = WriterTextView.defaultCursorColor {
+        didSet {
+            guard !oldValue.isEqual(customCursorColor) else { return }
+            updateCursorColor()
+            scheduleStyling(reason: .fullRefresh)
+        }
+    }
 
-    private static let cursorColorLight = NSColor(calibratedRed: 1.0, green: 0.302, blue: 0.251, alpha: 0.98) // #ff4d40
-    private static let cursorColorDark = NSColor(calibratedRed: 1.0, green: 0.302, blue: 0.251, alpha: 0.98) // #ff4d40
+    private static let defaultCursorColor = NSColor(calibratedRed: 1.0, green: 0.302, blue: 0.251, alpha: 0.98) // #ff4d40
     private static let baseParagraphStyle: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = 8
         style.paragraphSpacing = 12
         style.lineBreakMode = .byWordWrapping
         return style
+    }()
+    private static let taskListRegex = try! NSRegularExpression(
+        pattern: #"^([ \t]*)([-+*])\s+\[(?: |x|X)\]\s*(.*)$"#,
+        options: []
+    )
+    private static let unorderedListRegex = try! NSRegularExpression(
+        pattern: #"^([ \t]*)([-+*])\s+(.*)$"#,
+        options: []
+    )
+    private static let orderedListRegex = try! NSRegularExpression(
+        pattern: #"^([ \t]*)(\d+)\.\s+(.*)$"#,
+        options: []
+    )
+    private static let taskListMarkerStateRegex = try! NSRegularExpression(
+        pattern: #"(?m)^([ \t]*[-+*][ \t]+\[)([ xX])(\][ \t]*)"#,
+        options: []
+    )
+    private static let easterEggTermsRegex: NSRegularExpression = {
+        let terms = [
+            "tax", "taxes", "taxation",
+            "impuesto", "impuestos", "tributo", "tributos",
+            "impot", "impôt", "impôts", "taxe", "taxes",
+            "steuer", "steuern", "abgabe",
+            "tassa", "tasse", "imposta", "imposte",
+            "imposto", "impostos", "taxa", "taxas",
+            "belasting", "belastingen",
+            "налог", "налоги", "налогообложение",
+            "податок", "податки",
+            "podatek", "podatki",
+            "daň", "daně", "dane",
+            "adó", "adók",
+            "vergi", "vergiler", "vergisi",
+            "φόρος", "φόροι",
+            "impozit", "impozite",
+            "данък", "данъци",
+            "porez", "porezi",
+            "davek", "davki",
+            "mokestis", "mokesčiai",
+            "nodoklis", "nodokļi",
+            "maks", "maksud",
+            "skatt", "skatter", "skat", "skattur", "skattar",
+            "vero", "verot",
+            "세금", "조세",
+            "税", "税金", "租税", "税收",
+            "稅", "稅金", "稅收",
+            "ภาษี",
+            "कर", "करों",
+            "কর",
+            "வரி",
+            "పన్ను",
+            "ತೆರಿಗೆ",
+            "നികുതി",
+            "ਟੈਕਸ", "ਕਰ",
+            "thuế",
+            "pajak",
+            "cukai",
+            "buwis",
+            "ضريبة", "ضرائب",
+            "مالیات",
+            "ٹیکس",
+            "מס", "מיסים",
+            "kodi",
+            "intela",
+            "irhafu",
+            "owa-ori", "owo-ori",
+            "გადასახადი",
+            "հարկ",
+            "crawfish", "crawfishes",
+            "crayfish", "crayfishes",
+            "crawdad", "crawdads",
+            "crawdaddy", "crawdaddies",
+            "mudbug", "mudbugs",
+            "yabby", "yabbies",
+            "écrevisse", "écrevisses", "ecrevisse", "ecrevisses",
+            "cangrejo de río", "cangrejos de río",
+            "langostino de río", "langostinos de río",
+            "gambero di fiume", "gamberi di fiume",
+            "flusskrebs", "flusskrebse",
+            "kerevit", "kerevitler",
+            "karavida", "καραβίδα", "καραβίδες",
+            "tôm hùm đất",
+            "udang karang air tawar",
+            "กุ้งเครย์ฟิช", "เครย์ฟิช",
+            "ザリガニ", "アメリカザリガニ",
+            "가재",
+            "小龙虾", "小龍蝦", "螯虾", "螯蝦", "淡水龙虾", "淡水龍蝦",
+            "речной рак", "речные раки",
+            "rak rzeczny", "raki rzeczne",
+            "річковий рак"
+        ]
+        let escaped = terms.map { NSRegularExpression.escapedPattern(for: $0) }
+        let pattern = "(?<![\\p{L}\\p{N}_])(?:" + escaped.joined(separator: "|") + ")(?![\\p{L}\\p{N}_])"
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
     private let stylingQueue = DispatchQueue(label: "ecrivisse.styling", qos: .userInitiated)
@@ -241,6 +355,10 @@ final class WriterTextView: NSTextView {
     private var aiGeneratedRanges: [NSRange] = []
     private var aiGradientPhase: CGFloat = 0
     private var aiGradientTimer: Timer?
+    private let easterEggHighlightFadeDuration: TimeInterval = 1.5
+    private var easterEggHighlightFadeStart: Date?
+    private var easterEggActiveMatchRange: NSRange?
+    private var easterEggHighlightTimer: Timer?
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
@@ -255,6 +373,7 @@ final class WriterTextView: NSTextView {
     deinit {
         pendingWork?.cancel()
         aiGradientTimer?.invalidate()
+        easterEggHighlightTimer?.invalidate()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -290,6 +409,9 @@ final class WriterTextView: NSTextView {
             default:
                 break
             }
+        }
+        if modifiers.isEmpty, isReturnKeyEvent(event), handleListContinuationOnReturnKey() {
+            return
         }
         super.keyDown(with: event)
     }
@@ -329,6 +451,9 @@ final class WriterTextView: NSTextView {
             hasDeferredStyleForComposition = true
             pendingWork?.cancel()
             return
+        }
+        if reason == .textChanged {
+            noteEasterEggHighlightPulse()
         }
 
         styleGeneration += 1
@@ -450,8 +575,7 @@ final class WriterTextView: NSTextView {
     }
 
     private func updateCursorColor() {
-        let isDarkMode = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        insertionPointColor = isDarkMode ? Self.cursorColorDark : Self.cursorColorLight
+        insertionPointColor = customCursorColor
     }
 
     private func captureStylingInput() -> StylingInput {
@@ -513,11 +637,124 @@ final class WriterTextView: NSTextView {
             )
         }
 
+        let easterEggFadeTargetColor: NSColor = plan.isDarkMode ? .white : baseColor
         applyAIGradientIfNeeded(to: textStorage, darkMode: plan.isDarkMode)
+        applyEasterEggTermHighlightsIfNeeded(to: textStorage, fadeTargetColor: easterEggFadeTargetColor)
         textStorage.endEditing()
 
         refreshTypingAttributes()
         applyingStyle = false
+    }
+
+    private func applyEasterEggTermHighlightsIfNeeded(to textStorage: NSTextStorage, fadeTargetColor: NSColor) {
+        guard let fadeStart = easterEggHighlightFadeStart else { return }
+        guard let activeRange = easterEggActiveMatchRange else { return }
+
+        let text = textStorage.string
+        guard !text.isEmpty else { return }
+
+        let elapsed = Date().timeIntervalSince(fadeStart)
+        let clampedProgress = min(max(elapsed / easterEggHighlightFadeDuration, 0), 1)
+        guard clampedProgress < 1 else {
+            easterEggHighlightFadeStart = nil
+            easterEggActiveMatchRange = nil
+            stopEasterEggHighlightTimerIfNeeded()
+            return
+        }
+
+        let nsText = text as NSString
+        let safeRange = Self.clamp(range: activeRange, upperBound: nsText.length)
+        guard safeRange.length > 0 else {
+            easterEggHighlightFadeStart = nil
+            easterEggActiveMatchRange = nil
+            stopEasterEggHighlightTimerIfNeeded()
+            return
+        }
+
+        let candidate = nsText.substring(with: safeRange)
+        let candidateRange = NSRange(location: 0, length: (candidate as NSString).length)
+        guard let anchored = Self.easterEggTermsRegex.firstMatch(
+            in: candidate,
+            options: [.anchored],
+            range: candidateRange
+        ) else {
+            easterEggHighlightFadeStart = nil
+            easterEggActiveMatchRange = nil
+            stopEasterEggHighlightTimerIfNeeded()
+            return
+        }
+        guard anchored.range(at: 0).location == 0, anchored.range(at: 0).length == candidateRange.length else {
+            easterEggHighlightFadeStart = nil
+            easterEggActiveMatchRange = nil
+            stopEasterEggHighlightTimerIfNeeded()
+            return
+        }
+
+        let fadedColor = Self.blendColor(customCursorColor, fadeTargetColor, factor: CGFloat(clampedProgress))
+        textStorage.addAttribute(.foregroundColor, value: fadedColor, range: safeRange)
+    }
+
+    private func noteEasterEggHighlightPulse() {
+        let text = string
+        let textLength = (text as NSString).length
+        let caret = Self.clamp(range: selectedRange(), upperBound: textLength).location
+        guard let activeMatch = Self.easterEggMatchRange(in: text, caretLocation: caret) else {
+            if easterEggHighlightFadeStart != nil, easterEggActiveMatchRange != nil {
+                ensureEasterEggHighlightTimer()
+            }
+            return
+        }
+
+        easterEggActiveMatchRange = activeMatch
+        easterEggHighlightFadeStart = Date()
+        ensureEasterEggHighlightTimer()
+    }
+
+    private static func easterEggMatchRange(in text: String, caretLocation: Int) -> NSRange? {
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        let safeCaret = max(0, min(caretLocation, nsText.length))
+        let matches = easterEggTermsRegex.matches(in: text, options: [], range: fullRange)
+
+        for match in matches {
+            let range = match.range(at: 0)
+            guard range.location != NSNotFound, range.length > 0 else { continue }
+            if safeCaret >= range.location && safeCaret <= NSMaxRange(range) {
+                return range
+            }
+        }
+        return nil
+    }
+
+    private func ensureEasterEggHighlightTimer() {
+        guard easterEggHighlightTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.06, repeats: true) { [weak self] _ in
+            self?.tickEasterEggHighlightFade()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        easterEggHighlightTimer = timer
+    }
+
+    private func stopEasterEggHighlightTimerIfNeeded() {
+        easterEggHighlightTimer?.invalidate()
+        easterEggHighlightTimer = nil
+    }
+
+    private func tickEasterEggHighlightFade() {
+        guard let fadeStart = easterEggHighlightFadeStart else {
+            stopEasterEggHighlightTimerIfNeeded()
+            return
+        }
+
+        if Date().timeIntervalSince(fadeStart) >= easterEggHighlightFadeDuration {
+            easterEggHighlightFadeStart = nil
+            easterEggActiveMatchRange = nil
+            stopEasterEggHighlightTimerIfNeeded()
+            scheduleStyling(reason: .fullRefresh)
+            return
+        }
+
+        scheduleStyling(reason: .aiAnimationTick)
     }
 
     private static func focusedRange(for mode: FocusMode, selection: NSRange, text: NSString) -> NSRange? {
@@ -578,6 +815,39 @@ final class WriterTextView: NSTextView {
         return (selection.location, totalLength)
     }
 
+    func scrollToSourceLine(_ line: Int) {
+        let nsText = string as NSString
+        let targetLine = max(0, line)
+        let location = Self.locationForLine(targetLine, in: nsText)
+        let targetRange = NSRange(location: location, length: 0)
+
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+        setSelectedRange(targetRange)
+        scrollRangeToVisible(targetRange)
+        scheduleStyling(reason: .selectionChanged)
+    }
+
+    private static func locationForLine(_ line: Int, in text: NSString) -> Int {
+        if line <= 0 || text.length == 0 {
+            return 0
+        }
+
+        var currentLine = 0
+        var location = 0
+        while currentLine < line && location < text.length {
+            let lineRange = text.lineRange(for: NSRange(location: location, length: 0))
+            let nextLocation = NSMaxRange(lineRange)
+            if nextLocation <= location {
+                break
+            }
+            location = nextLocation
+            currentLine += 1
+        }
+        return min(location, text.length)
+    }
+
     private static func editorFont(size: CGFloat) -> NSFont {
         NSFont.monospacedSystemFont(ofSize: clampedFontSize(size), weight: .regular)
     }
@@ -626,6 +896,121 @@ final class WriterTextView: NSTextView {
         scheduleStyling(reason: .textChanged)
     }
 
+    private func isReturnKeyEvent(_ event: NSEvent) -> Bool {
+        if event.keyCode == 36 || event.keyCode == 76 {
+            return true
+        }
+        guard let characters = event.charactersIgnoringModifiers else {
+            return false
+        }
+        return characters == "\r" || characters == "\n"
+    }
+
+    private func handleListContinuationOnReturnKey() -> Bool {
+        guard isEditable else { return false }
+        guard !hasMarkedText() else { return false }
+
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        guard selection.length == 0 else { return false }
+
+        if totalLength == 0 {
+            return false
+        }
+
+        let probeLocation: Int
+        if selection.location >= totalLength {
+            probeLocation = max(totalLength - 1, 0)
+        } else {
+            probeLocation = selection.location
+        }
+
+        let lineRange = nsText.lineRange(for: NSRange(location: probeLocation, length: 0))
+        let rawLine = nsText.substring(with: lineRange)
+        let line = rawLine.replacingOccurrences(of: #"\r?\n$"#, with: "", options: .regularExpression)
+        guard let continuation = Self.listContinuation(for: line) else {
+            return false
+        }
+
+        let lineLength = (line as NSString).length
+        let caretInLine = min(max(selection.location - lineRange.location, 0), lineLength)
+
+        if continuation.isContentEmpty,
+           caretInLine >= continuation.markerLength {
+            let markerRange = NSRange(location: lineRange.location, length: continuation.markerLength)
+            guard shouldChangeText(in: markerRange, replacementString: "") else { return true }
+            textStorage?.replaceCharacters(in: markerRange, with: "")
+            didChangeText()
+            let newLocation = max(lineRange.location, selection.location - continuation.markerLength)
+            setSelectedRange(NSRange(location: newLocation, length: 0))
+            scheduleStyling(reason: .textChanged)
+            return true
+        }
+
+        let insertion = "\n" + continuation.insertionPrefix
+        guard shouldChangeText(in: selection, replacementString: insertion) else { return true }
+        textStorage?.replaceCharacters(in: selection, with: insertion)
+        didChangeText()
+        let newLocation = selection.location + (insertion as NSString).length
+        setSelectedRange(NSRange(location: newLocation, length: 0))
+        scheduleStyling(reason: .textChanged)
+        return true
+    }
+
+    private static func listContinuation(for line: String) -> ListContinuation? {
+        let nsLine = line as NSString
+        let fullRange = NSRange(location: 0, length: nsLine.length)
+
+        if let match = taskListRegex.firstMatch(in: line, options: [], range: fullRange),
+           match.numberOfRanges >= 4,
+           match.range(at: 1).location != NSNotFound,
+           match.range(at: 2).location != NSNotFound,
+           match.range(at: 3).location != NSNotFound {
+            let indent = nsLine.substring(with: match.range(at: 1))
+            let bullet = nsLine.substring(with: match.range(at: 2))
+            let content = nsLine.substring(with: match.range(at: 3))
+            return ListContinuation(
+                insertionPrefix: "\(indent)\(bullet) [ ] ",
+                markerLength: match.range(at: 3).location,
+                isContentEmpty: content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+
+        if let match = orderedListRegex.firstMatch(in: line, options: [], range: fullRange),
+           match.numberOfRanges >= 4,
+           match.range(at: 1).location != NSNotFound,
+           match.range(at: 2).location != NSNotFound,
+           match.range(at: 3).location != NSNotFound {
+            let indent = nsLine.substring(with: match.range(at: 1))
+            let numberString = nsLine.substring(with: match.range(at: 2))
+            let content = nsLine.substring(with: match.range(at: 3))
+            let currentNumber = Int(numberString) ?? 1
+            return ListContinuation(
+                insertionPrefix: "\(indent)\(currentNumber + 1). ",
+                markerLength: match.range(at: 3).location,
+                isContentEmpty: content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+
+        if let match = unorderedListRegex.firstMatch(in: line, options: [], range: fullRange),
+           match.numberOfRanges >= 4,
+           match.range(at: 1).location != NSNotFound,
+           match.range(at: 2).location != NSNotFound,
+           match.range(at: 3).location != NSNotFound {
+            let indent = nsLine.substring(with: match.range(at: 1))
+            let bullet = nsLine.substring(with: match.range(at: 2))
+            let content = nsLine.substring(with: match.range(at: 3))
+            return ListContinuation(
+                insertionPrefix: "\(indent)\(bullet) ",
+                markerLength: match.range(at: 3).location,
+                isContentEmpty: content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+
+        return nil
+    }
+
     func applyMarkdownAction(_ action: MarkdownEditorAction) {
         guard isEditable else { return }
         if window?.firstResponder !== self {
@@ -654,6 +1039,8 @@ final class WriterTextView: NSTextView {
             applyUnorderedList()
         case .orderedList:
             applyOrderedList()
+        case .checklist:
+            applyChecklist()
         case .link:
             insertMarkdownLink()
         case .codeBlock:
@@ -662,9 +1049,41 @@ final class WriterTextView: NSTextView {
             applyBlockquote()
         case .footnote:
             insertFootnote()
+        case .toc:
+            insertTableOfContentsMarker()
         case let .table(rows, columns):
             insertTable(rows: rows, columns: columns)
         }
+    }
+
+    @discardableResult
+    func setTaskListItemChecked(at index: Int, checked: Bool) -> Bool {
+        guard index >= 0 else { return false }
+        guard !hasMarkedText() else { return false }
+
+        let source = string
+        let nsSource = source as NSString
+        let fullRange = NSRange(location: 0, length: nsSource.length)
+        let matches = Self.taskListMarkerStateRegex.matches(in: source, options: [], range: fullRange)
+        guard index < matches.count else { return false }
+
+        let target = matches[index]
+        guard target.numberOfRanges > 2 else { return false }
+        let stateRange = target.range(at: 2)
+        guard stateRange.location != NSNotFound, stateRange.length > 0 else { return false }
+
+        let replacement = checked ? "x" : " "
+        if nsSource.substring(with: stateRange) == replacement {
+            return false
+        }
+
+        guard shouldChangeText(in: stateRange, replacementString: replacement) else {
+            return false
+        }
+        textStorage?.replaceCharacters(in: stateRange, with: replacement)
+        didChangeText()
+        scheduleStyling(reason: .textChanged)
+        return true
     }
 
     private func wrapSelection(prefix: String, suffix: String, placeholder: String = "") {
@@ -729,6 +1148,22 @@ final class WriterTextView: NSTextView {
             )
             defer { itemIndex += 1 }
             return "\(itemIndex). " + stripped.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private func applyChecklist() {
+        transformSelectedLines { line, _ in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return line }
+
+            let indentationMatch = line.range(of: #"^[ \t]*"#, options: .regularExpression)
+            let indentation = indentationMatch.map { String(line[$0]) } ?? ""
+            let stripped = line.replacingOccurrences(
+                of: #"^\s*(?:[-+*]\s+\[(?: |x|X)\]\s+|[-+*]\s+|\d+\.\s+)"#,
+                with: "",
+                options: .regularExpression
+            )
+            return "\(indentation)- [ ] " + stripped.trimmingCharacters(in: .whitespaces)
         }
     }
 
@@ -870,6 +1305,39 @@ final class WriterTextView: NSTextView {
             )
         }
 
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func insertTableOfContentsMarker() {
+        let marker = "{{TOC}}"
+        let nsText = string as NSString
+        let selection = Self.clamp(range: selectedRange(), upperBound: nsText.length)
+
+        let beforeIsLineBreak: Bool
+        if selection.location == 0 {
+            beforeIsLineBreak = true
+        } else {
+            beforeIsLineBreak = nsText.substring(with: NSRange(location: selection.location - 1, length: 1)) == "\n"
+        }
+
+        let afterLocation = selection.location + selection.length
+        let afterIsLineBreak: Bool
+        if afterLocation >= nsText.length {
+            afterIsLineBreak = true
+        } else {
+            afterIsLineBreak = nsText.substring(with: NSRange(location: afterLocation, length: 1)) == "\n"
+        }
+
+        let prefix = beforeIsLineBreak ? "" : "\n"
+        let suffix = afterIsLineBreak ? "" : "\n"
+        let replacement = prefix + marker + suffix
+
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+
+        let cursorLocation = selection.location + (prefix as NSString).length + (marker as NSString).length
+        setSelectedRange(NSRange(location: cursorLocation, length: 0))
         scheduleStyling(reason: .textChanged)
     }
 
